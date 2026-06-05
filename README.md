@@ -1,10 +1,10 @@
 # OP2NetworkTools
 
-A suite of from-scratch network tools for **Outpost 2**, all speaking the game's own wire
+A suite of network tools for **Outpost 2**, all speaking the game's own wire
 protocols **without running Outpost 2**. The headline result is a complete external
 multiplayer **client** - an independent (non-engine) Outpost 2 client: it
 joins, readies, starts, and plays a real multiplayer game as Player 2, holding the lockstep
-simulation and chatting both ways. Everything was reverse-engineered from Outpost 2.
+simulation and chatting both ways.
 
 ## Projects
 
@@ -40,5 +40,5 @@ where the protocol was cracked. Heavily diagnostic (toggle the per-packet dumps 
 Each project folder has its own README with build + usage details.
 
 ## Status
-Verified live against a retail 1.3.6 host: LAN discovery, full join->play pipeline, two-way
+Verified live against Outpost 2 host: LAN discovery, full join->play pipeline, two-way
 lobby and in-game chat, and a stable lockstep match with the external client as Player 2.

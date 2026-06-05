@@ -49,10 +49,17 @@ op2::ClientState st = client.snapshot();   // immutable copy, taken under a mute
 ## Behaviors
 - **Auto-ready** on join, so the host can START.
 - **Auto-greetings**: `Hello from OP2DummyPlayer!` on entering the lobby, and
-  `Good Luck! Have Fun!` about 100 ticks into the game.
+  `Good Luck! Have Fun!` about 50 ticks into the game.
 - **Clean leaving** (Disconnect button or closing the window):
   - From the **lobby** -> sends a real **cmd-0x0B quit** so the host frees our slot (no chat).
-  - From an **in-game** match -> sends `I am leaving the game.` in chat, delivers it, then exits.
+  - From an **in-game** match -> self-sends a final command turn carrying `I am leaving the
+    game.` (chat block `0x30`) and a **ctQuit** (command block `0x31`) at a fresh mark, so the
+    host removes us **cleanly and immediately** instead of waiting out our lockstep drop-timeout.
+    Verified live: the host prints `OPU has quit the game` (not the "lost contact" dialog). The
+    turn is self-originated, so it works even when the host pauses on losing focus.
+- **In-game chat from all players**: shows every player's in-game messages (peer-to-peer chat,
+  not just the host's), each labelled with its sender, and announces `*** <name> has left the
+  game ***` when a player quits mid-match.
 - **Disconnect handling**:
   - A user Disconnect / rejoin clears the chat for a fresh session.
   - A **host-initiated** end (game over, host quit, eject, timeout) does **not** clear the chat -
@@ -101,6 +108,10 @@ cmake --build build
 
 ## Notes & limitations
 - Verified against **retail 1.3.6** on a LAN; OPU 1.4.1 shares the wire format.
+- **Multi-peer (3+ players) supported.** Gameplay is peer-to-peer, so the bot parses the cmd-4
+  roster into a peer table and broadcasts its command turns (dst 0, flags 0x00) to every peer,
+  and reads chat + leaves from every player's turn. Verified live in a 3-player match (ran past
+  3400 ticks, all players' chat shown, clean "X has left the game"). See `..\FINDINGS.md` #17.
 - Firewall: allow the app (or inbound UDP on 47776-47807), same as Outpost 2 itself.
 - The bot is an **idle (passive) player**: it keeps the lockstep alive with empty command
   turns and chats, but issues no gameplay commands. The file checksum is skipped (it is a

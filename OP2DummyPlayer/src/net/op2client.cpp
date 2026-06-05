@@ -155,8 +155,8 @@ void Client::disconnect() {
         Phase ph;
         { std::lock_guard<std::mutex> lk(mtx_); ph = state_.phase; }
         if (running_ && ph == Phase::InGame) {
-            // In a running game: say goodbye in-game chat, then exit after a short grace.
-            { std::lock_guard<std::mutex> lk(mtx_); pendingChat_.insert(pendingChat_.begin(), "I am leaving the game."); }
+            // In a running game: the worker self-sends a goodbye chat + ctQuit command turn
+            // (see run()'s leave handler), then exits.
             leaving_ = true;
         } else if (running_ && ph == Phase::InLobby) {
             // In the lobby (game not started): no chat - send a real cmd-0x0B quit so the host
@@ -321,6 +321,11 @@ void Client::run(bool scan, std::string targetIp) {
     uint8_t  ourSeqA = 1;                       // host expects our first channel-A seq = 1
     uint8_t  ourPlayerNum = (uint8_t)(assignedNetID & 7);
 
+    // PHASE-1: peer table, parsed from the cmd-4 roster (declared before the send lambdas so they
+    // can broadcast in-game command turns to every peer's game address).
+    struct PeerInfo { uint32_t netID; sockaddr_in addr; };
+    PeerInfo peers[6]; int peerCount=0; uint32_t peerSig=0;
+
     auto send_status = [&](sockaddr_in dst, uint16_t status){
         uint8_t p[20]; memset(p, 0, sizeof(p));
         wr32(p+0x00, assignedNetID); wr32(p+0x04, hostNetID);
@@ -394,13 +399,30 @@ void Client::run(bool scan, std::string targetIp) {
         if (blocksLen < 6) blocksLen = 6; if (blocksLen > 500) blocksLen = 500;
         int payloadSize = 10 + blocksLen, total = 14 + payloadSize;
         uint8_t p[600]; memset(p, 0, total);
-        wr32(p+0x00, assignedNetID); wr32(p+0x04, hostNetID);
+        wr32(p+0x00, assignedNetID);
         p[0x08]=(uint8_t)payloadSize; p[0x09]=0;
         p[0x0E]=0x0A; p[0x0F]=++ourSeqA; p[0x10]=ackA; p[0x11]=ackB;
         p[0x12]=0x0C; p[0x13]=ourPlayerNum; wr32(p+0x14, execTick);
         memcpy(p+0x18, blocks, blocksLen);
-        wr32(p+0x0A, wire_cksum(p));
-        sendto(gs,(char*)p,total,0,(sockaddr*)&gameAddr,sizeof(gameAddr));
+        if (peerCount >= 2) {
+            // 3+ players: gameplay is peer-to-peer and command turns are BROADCAST (dst 0) with
+            // GUR flags = 0x00 - the engine's own format (observed on the wire). flags 0 means no
+            // channel + no seq validation: the turn is accepted by every peer and deduped by its
+            // execution mark. This is essential because our channel-A stream was only ever sent to
+            // the host during the lobby, so a 3rd player would reject channel-A turns as
+            // out-of-sequence. Send the same turn to every peer's game address (gate accepts
+            // dest == theirNetID || 0).
+            p[0x0E] = 0x00;
+            wr32(p+0x04, 0);
+            wr32(p+0x0A, wire_cksum(p));
+            for (int i = 0; i < peerCount; i++)
+                sendto(gs,(char*)p,total,0,(sockaddr*)&peers[i].addr,sizeof(peers[i].addr));
+        } else {
+            // 2 players: the only peer is the host (the original, proven path).
+            wr32(p+0x04, hostNetID);
+            wr32(p+0x0A, wire_cksum(p));
+            sendto(gs,(char*)p,total,0,(sockaddr*)&gameAddr,sizeof(gameAddr));
+        }
     };
 
     // progress the host into the lobby/GUR phase, then announce ourselves (cmd-3)
@@ -419,9 +441,18 @@ void Client::run(bool scan, std::string targetIp) {
     bool chatActive=false; int chatMark=0; std::string chatText, lastRecvChat, lastLobbyChat;
     // ally-back: if the host allies with us (command block type 0x32), ally back at a fresh mark
     bool allyActive=false; int allyMark=0; std::string lastAllyData; uint8_t allyData[16]; int allyDataLen=0;
+    // clean in-game leave: when leaving, self-initiate a cmd-0x0C carrying a goodbye chat (0x30)
+    // and a ctQuit (0x31) block at fresh marks - independent of incoming host turns, because on a
+    // one-machine setup the host stops sending turns the instant it loses focus (when you click
+    // the bot). Self-sending makes the host remove us cleanly instead of stalling until our drop
+    // timeout (~800 ms) and showing the "lost contact" dialog.
+    bool quitInGameSent=false; uint64_t quitDoneMs=0;
+    bool playerLeft[6] = {false,false,false,false,false,false};   // announced "<name> has left" once per slot
+    std::string lastChatBySlot[6];                                // de-dup in-game chat per sender slot
     long cmd0cSent=0, cmd0cRecv=0;
     bool glhfSent=false, quitSent=false;  // auto-greeting / lobby-quit one-shots
     uint64_t lastKeep=0, lastRecv=now_ms(), lastCmdTurnMs=0, leaveStartMs=0;
+    uint8_t leaveBuf[200]; int leaveBufLen=0, leaveExec=0;   // pre-built goodbye+ctQuit leave turn
 
     while (!stop_) {
         uint8_t buf[1400]; sockaddr_in from; socklen_t fl = sizeof(from);
@@ -465,7 +496,44 @@ void Client::run(bool scan, std::string targetIp) {
             // START-time roster control (type-1): cmd-4 -> status(3), cmd-5 -> status(4)
             if (buf[0x09]==1 && n>=0x12) {
                 uint32_t cc = rd32(buf+0x0E);
-                if (cc==4) send_status(gameAddr, 3);
+                if (cc==4) {
+                    send_status(gameAddr, 3);
+                    // Parse the SetPlayerList roster into our peer table - every other
+                    // player's netID + real game address (bound port from the roster, NOT the
+                    // ephemeral source port). Layout at payload 0x12: numPlayers(u32), then 6 slots
+                    // of [IP(4, net order) | port(2, host order) | status(2) | netID(4, LE)].
+                    {
+                        PeerInfo np6[6]; int newCount = 0;
+                        for (int s = 0; s < 6; s++) {
+                            const uint8_t* e = buf + 0x16 + s*12;
+                            if (e + 12 > buf + n) break;
+                            uint32_t pid = rd32(e + 8);
+                            if (pid == 0 || pid == assignedNetID) continue;   // skip empty + ourselves
+                            PeerInfo& pe = np6[newCount];
+                            pe.netID = pid;
+                            memset(&pe.addr, 0, sizeof(pe.addr));
+                            pe.addr.sin_family = AF_INET;
+                            memcpy(&pe.addr.sin_addr, e, 4);          // IP is already network order
+                            pe.addr.sin_port = htons(rd16(e + 4));    // port is stored host order
+                            newCount++;
+                        }
+                        // adopt + log only when the set changes (cmd-4 repeats during the handshake)
+                        uint32_t sig = (uint32_t)newCount;
+                        for (int i = 0; i < newCount; i++) sig = sig * 131 + np6[i].netID;
+                        if (sig != peerSig) {
+                            peerSig = sig; peerCount = newCount;
+                            std::string log = "peer table (" + std::to_string(peerCount) + "): ";
+                            for (int i = 0; i < newCount; i++) {
+                                peers[i] = np6[i];
+                                unsigned char* ib = (unsigned char*)&peers[i].addr.sin_addr; char t[64];
+                                snprintf(t, sizeof(t), "%08X@%u.%u.%u.%u:%u ", peers[i].netID,
+                                         ib[0], ib[1], ib[2], ib[3], (unsigned)ntohs(peers[i].addr.sin_port));
+                                log += t;
+                            }
+                            debug_log(log);
+                        }
+                    }
+                }
                 else if (cc==5) send_status(gameAddr, 4);
             }
             // lobby/connection EVENTS (sequenced host packet, engine cmd at 0x12)
@@ -486,15 +554,24 @@ void Client::run(bool scan, std::string targetIp) {
                 // host repeats; ourSeqA is stable through the start phase so the seq stays put.
                 if (ec == 8) { if (!loadedSent) { ++ourSeqA; loadedSent = true; } send_loaded(); }
                 if (ec == 9 && loadedSent) {
-                    send_gur_ack(gameAddr); gameLive = true; gameStartMs = now_ms();
-                    { std::lock_guard<std::mutex> lk(mtx_); state_.gameStarted = true; }
-                    setPhase(Phase::InGame, "Game started.");
-                    addChat("", "*** GAME STARTED ***", false);
+                    send_gur_ack(gameAddr);
+                    // Announce the start once. The host resends the cmd-9 "GO" reliably, and the
+                    // cmd-0x0C handler also flips gameLive on its first turn - guard so we don't
+                    // print "*** GAME STARTED ***" twice.
+                    if (!gameLive) {
+                        gameLive = true; gameStartMs = now_ms();
+                        { std::lock_guard<std::mutex> lk(mtx_); state_.gameStarted = true; }
+                        setPhase(Phase::InGame, "Game started.");
+                        addChat("", "*** GAME STARTED ***", false);
+                    }
                 }
             }
-            // IN-GAME command turn (engine cmd 0x0C): track tick, surface/inject chat, reply
-            if (buf[0x09]==0 && n>=0x18 && buf[0x12]==0x0C && rd32(buf+0x00)==hostNetID) {
-                if (!gameLive) { gameLive = true; gameStartMs = now_ms(); { std::lock_guard<std::mutex> lk(mtx_); state_.gameStarted = true; } setPhase(Phase::InGame, "Game started."); }
+            // IN-GAME command turn (engine cmd 0x0C): track tick, surface/inject chat, reply.
+            // Skip entirely once leaving: the leave handler self-sends our final turn (goodbye +
+            // ctQuit) at a pinned mark, so we must stop mirroring or maxSentMark would advance past
+            // it and the host would reject the quit.
+            if (!leaving_ && buf[0x09]==0 && n>=0x18 && buf[0x12]==0x0C && rd32(buf+0x00)==hostNetID) {
+                if (!gameLive) { gameLive = true; gameStartMs = now_ms(); { std::lock_guard<std::mutex> lk(mtx_); state_.gameStarted = true; } setPhase(Phase::InGame, "Game started."); addChat("", "*** GAME STARTED ***", false); }
                 cmd0cRecv++;
                 int execTick = (int)rd32(buf+0x14);
                 if (!haveFirstExec) { haveFirstExec=true; firstExec=execTick; lookahead=-execTick; }
@@ -578,6 +655,37 @@ void Client::run(bool scan, std::string targetIp) {
                 state_.gameDurationSec = gameStartMs ? (now_ms()-gameStartMs)/1000.0 : 0.0;
                 state_.cmdSent = cmd0cSent; state_.cmdRecv = cmd0cRecv;
             }
+            // Every OTHER player's command turn (peer or host): surface their in-game chat (block
+            // 0x30) and detect them leaving (ctQuit 0x31). In-game chat is peer-to-peer - each
+            // player's chat rides in THEIR OWN turn (turn playerNum at wire 0x13 = sender slot), so
+            // the host-only mirror above never sees a peer's messages. This pass is read-only (it
+            // does not mirror) and walks any non-self turn. (The host's own chat is still shown by
+            // the mirror handler, so 0x30 here is gated to non-host sources to avoid duplicates.)
+            if (buf[0x09]==0 && n>=0x18 && buf[0x12]==0x0C) {
+                uint32_t lsrc = rd32(buf+0x00);
+                int lslot = buf[0x13];
+                if (lsrc != assignedNetID && lslot >= 0 && lslot < 6 && lslot != (int)ourPlayerNum) {
+                    std::string nm;
+                    { std::lock_guard<std::mutex> lk(mtx_);
+                      if (state_.lobby.slot[lslot].occupied && !state_.lobby.slot[lslot].name.empty())
+                          nm = state_.lobby.slot[lslot].name; }
+                    if (nm.empty()) nm = "Player " + std::to_string(lslot);
+                    for (int o = 0x18; o + 6 <= n; ) {
+                        uint8_t bt = buf[o], bl = buf[o+1];
+                        if (o + 6 + bl > n) break;
+                        if (bt == 0x30 && bl >= 3 && lsrc != hostNetID) {
+                            // in-game chat: data = [sender(1), recipientMask(1), text, NUL].
+                            const char* txt = (const char*)(buf + o + 6 + 2);
+                            if (lastChatBySlot[lslot] != txt) { lastChatBySlot[lslot] = txt; addChat(nm, txt, false); }
+                        } else if (bt == 0x31 && !playerLeft[lslot]) {   // ctQuit - this player left
+                            playerLeft[lslot] = true;
+                            addChat("", std::string("*** ") + nm + " has left the game ***", false);
+                            debug_log("peer left: slot " + std::to_string(lslot) + " (" + nm + ") sent ctQuit (0x31)");
+                        }
+                        o += 6 + bl;
+                    }
+                }
+            }
             // latch lobby join + auto ready-up
             if (!lobbyJoined && hostAckA >= ourSeqA) {
                 lobbyJoined = true;
@@ -603,21 +711,49 @@ void Client::run(bool scan, std::string targetIp) {
             send_gur_ack(gameAddr);
             lastKeep = now_ms();
         }
-        // graceful leave: deliver the goodbye/quit, then exit after a short grace window.
-        // Lobby: a real cmd-0x0B quit (host frees our slot). In-game: the queued goodbye chat
-        // goes out via the normal chat path; we just hold the connection open briefly.
+        // graceful leave: deliver the goodbye/quit, then exit.
+        // Lobby: a real cmd-0x0B quit (host frees our slot), which acks fast.
+        // In-game: SELF-SEND a command turn (cmd-0x0C) carrying a goodbye chat block (0x30) at a
+        // fresh mark and a ctQuit block (0x31) at the next mark. This does not wait for an incoming
+        // host turn - on a one-machine setup the host stops sending turns the moment it loses focus
+        // (when you click the bot), so a turn-driven quit would never get out. We build the turn
+        // once (pinning the marks + synthetic non-zero unk tokens, the same way our filler turns
+        // use 0xBABE3624), then resend it each loop tick for ~1.2s so it survives loss / a paused
+        // host's socket buffer, then exit.
         if (leaving_) {
             if (leaveStartMs == 0) leaveStartMs = now_ms();
-            if (sendQuit_ && !quitSent) { for (int r=0;r<3;r++) send_quit(); quitSent = true; debug_log("sent lobby quit (cmd-0x0B)"); }
-            uint64_t grace = sendQuit_ ? 700u : 1200u;     // quit acks fast; chat needs a few turns
-            if (now_ms() - leaveStartMs > grace) break;
+            if (sendQuit_) {
+                if (!quitSent) { for (int r=0;r<3;r++) send_quit(); quitSent = true; debug_log("sent lobby quit (cmd-0x0B)"); }
+                if (now_ms() - leaveStartMs > 700) break;
+            } else if (gameLive) {
+                static const char* GOODBYE = "I am leaving the game.";
+                if (leaveBufLen == 0) {
+                    int baseMark = maxSentMark + cppi; if (baseMark < cppi) baseMark = cppi;
+                    leaveExec = baseMark;
+                    int ol = 0, tl = (int)strlen(GOODBYE), dl = 2 + tl + 1;
+                    // block 0: in-game chat "I am leaving the game." at baseMark
+                    leaveBuf[ol]=0x30; leaveBuf[ol+1]=(uint8_t)dl; wr32(leaveBuf+ol+2, 0xBABE3624u);
+                    leaveBuf[ol+6]=ourPlayerNum; leaveBuf[ol+7]=0xFF; memcpy(leaveBuf+ol+8, GOODBYE, tl); leaveBuf[ol+8+tl]=0;
+                    ol += 6 + dl;
+                    // block 1: ctQuit (no data - the quitting player is the turn's playerNum) at baseMark+cppi
+                    leaveBuf[ol]=0x31; leaveBuf[ol+1]=0; wr32(leaveBuf+ol+2, 0xBABE3625u); ol += 6;
+                    leaveBufLen = ol; maxSentMark = baseMark + cppi;
+                    addChat(myName, GOODBYE, true);
+                    debug_log("self-send leave: goodbye(0x30)+ctQuit(0x31) at marks " + std::to_string(baseMark) + "," + std::to_string(baseMark+cppi));
+                    quitInGameSent = true; quitDoneMs = now_ms();
+                }
+                send_cmd0c((uint32_t)leaveExec, leaveBuf, leaveBufLen);
+                if (now_ms() - quitDoneMs > 1200) break;
+            } else {
+                if (now_ms() - leaveStartMs > 1000) break;   // not in-game yet - just exit
+            }
         }
         // refresh duration even when no in-game packet arrived this tick
         if (gameLive) { std::lock_guard<std::mutex> lk(mtx_); state_.gameDurationSec = (now_ms()-gameStartMs)/1000.0; }
         // GAME ENDED: once command turns have been flowing, the host streams them continuously
         // (~30/s). A multi-second gap means the host ended/left the match. (Set only after the
         // first turn, so it never trips during the host's pre-game load pause.)
-        if (lastCmdTurnMs && now_ms() - lastCmdTurnMs > 6000) {
+        if (!leaving_ && lastCmdTurnMs && now_ms() - lastCmdTurnMs > 6000) {
             setDisconnected("Game ended (host left or the match is over).");
             break;
         }
