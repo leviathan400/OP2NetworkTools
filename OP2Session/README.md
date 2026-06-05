@@ -7,8 +7,7 @@ completes the join handshake, runs the reliable transport, appears in the GAME S
 lobby as a named player, chats, readies up, survives the start handshake, and then keeps the
 running game's lockstep simulation advancing by exchanging in-game command turns.
 
-> Status: **complete pipeline, verified live against a retail 1.3.6 host.** Believed to be
-> the first independent (non-engine) client to join and play an OP2 multiplayer game. A bot
+> Status: complete pipeline, verified live against Outpost 2 game.
 > ("OPU") joined the lobby, chatted both ways, readied up, drove the host through START,
 > and ran as Player 2 in a live match - the simulation advanced past 2000 ticks with 500+
 > command turns sent and acked, no desync.
@@ -73,23 +72,21 @@ the `0xFDE24ACB` family (`FUN_00490F10`). The four hard-won keys:
 4. **In-game** the command-turn receiver discards any block with a zero `unk` field, so we
    echo the host's command blocks verbatim under our player index.
 
-See `FINDINGS.md` for the full story and `PROTOCOL.md` for the byte-exact spec.
+See `..\FINDINGS.md` for the full story and `..\PROTOCOL.md` for the byte-exact spec.
 
 ## Files
 - `op2session.cpp` - the client (discovery + join + GUR + lobby + chat + ready + start +
   in-game command turns), heavily commented with the decompile function anchors.
 - `build.bat` - MSVC build (location-independent).
-- **`PROTOCOL.md`** - byte-exact wire protocol (join, GUR, lobby, chat, ready, start,
-  command turns) - the reference.
-- **`FINDINGS.md`** - the RE journey, gotchas, and lessons (read this to understand *why*).
-- `last_run.txt` / `live*.txt` - captured run logs (dev artifacts).
+- `op2session.ini` - the logging toggle (`[log] verbose=0/1`).
 
-Related docs (repo `docs\`): `JOIN_PROTOCOL.md` (over-arching spec),
-`START_CHECKSUM.md` (the game-start file checksum, fully RE'd).
+The protocol reference docs live in the repo root: **`..\PROTOCOL.md`** (byte-exact wire
+protocol), **`..\FINDINGS.md`** (the RE journey + gotchas), plus `..\JOIN_PROTOCOL.md` and
+`..\START_CHECKSUM.md`.
 
 ## Where to go next
 - **Act, don't idle**: fill real command blocks (build/move units) at command type != 0,
-  keeping a non-zero `unk`; the command-type enum is in `FINDINGS.md` / `PROTOCOL.md`.
+  keeping a non-zero `unk`; the command-type enum is in `..\FINDINGS.md` / `..\PROTOCOL.md`.
 - **Clean leave**: send `ctQuit` (command type 0x31) instead of relying on silence.
 - **Tidy build**: gate the diagnostic dump behind a `-v` flag for a reference-quality client.
 

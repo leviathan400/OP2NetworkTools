@@ -110,6 +110,6 @@ cmake --build build
   passive client can't tell those apart from an eject on the wire.
 - `winbuild.bat` hard-codes a VS install path; adjust it for your machine, or use the generic
   CMake commands above.
-- Protocol reference: `..\op2session\PROTOCOL.md` (byte-exact) and `..\op2session\FINDINGS.md`
+- Protocol reference: `..\PROTOCOL.md` (byte-exact) and `..\FINDINGS.md`
   (the reverse-engineering journey, including the in-game chat fresh-mark gotcha).
 - Parked future ideas (in-game actions, hosting games) are noted in `IDEAS.md`.

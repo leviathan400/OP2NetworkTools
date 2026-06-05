@@ -1,16 +1,50 @@
 # OP2NetworkTools
 
-Network tools for Outpost 2.
+A suite of from-scratch network tools for **Outpost 2**, all speaking the game's own wire
+protocols **without running Outpost 2**. The headline result is a complete external
+multiplayer **client** - an independent (non-engine) Outpost 2 client: it
+joins, readies, starts, and plays a real multiplayer game as Player 2, holding the lockstep
+simulation and chatting both ways. Everything was reverse-engineered from Outpost 2.
 
-# OP2LanScan
+## Projects
 
-![Screenshot](https://images.outpostuniverse.org/OP2LanScan.png)
-
-# OP2DummyPlayer
-
+### OP2DummyPlayer
 ![Screenshot](https://images.outpostuniverse.org/OP2DummyPlayer.png)
 
-# OP2Session
+The multiplayer client as a polished cross-platform (Windows + Linux) **Dear ImGui** GUI,
+with the reusable net-client library cleanly separated from the UI. Join, ready, play, and
+chat from a window. -> [`OP2DummyPlayer/README.md`](OP2DummyPlayer/README.md)
 
+### OP2LanScan
+![Screenshot](https://images.outpostuniverse.org/OP2LanScan.png)
+
+Finds OP2 multiplayer games on your LAN (and across subnets via direct-IP query). C# /
+WinForms desktop app. -> [`OP2LanScan/README.md`](OP2LanScan/README.md)
+
+### OP2Session
 ![Screenshot](https://images.outpostuniverse.org/OP2Session.png)
 
+The same multiplayer client as a single-file Windows console tool - the research front-end
+where the protocol was cracked. Heavily diagnostic (toggle the per-packet dumps via its
+`op2session.ini`). -> [`OP2Session/README.md`](OP2Session/README.md)
+
+### op2finder / op2finder-py
+C/Winsock console and Python implementations of the LAN discovery scanner.
+-> [`op2finder/README.md`](op2finder/README.md), [`op2finder-py/README.md`](op2finder-py/README.md)
+
+## Reference docs (repo root)
+- [`PROTOCOL.md`](PROTOCOL.md) - the multiplayer protocol, byte-exact: discover -> join ->
+  lobby -> start -> in-game command turns + chat.
+- [`NETWORK_PROTOCOL.md`](NETWORK_PROTOCOL.md) - deeper synthesis of the networking functions
+  (stack layers, GurManager reliability, lobby state machine, packet formats).
+- [`FINDINGS.md`](FINDINGS.md) - the reverse-engineering journey, gotchas, and lessons.
+- [`DISCOVERY_PROTOCOL.md`](DISCOVERY_PROTOCOL.md) - the UDP discovery query/reply wire spec.
+- [`JOIN_PROTOCOL.md`](JOIN_PROTOCOL.md) - early over-arching join + command-turn spec.
+- [`START_CHECKSUM.md`](START_CHECKSUM.md) - the game-start file checksum (why we can skip it).
+- [`NOTES.md`](NOTES.md) - discovery design notes.
+
+Each project folder has its own README with build + usage details.
+
+## Status
+Verified live against a retail 1.3.6 host: LAN discovery, full join->play pipeline, two-way
+lobby and in-game chat, and a stable lockstep match with the external client as Player 2.
