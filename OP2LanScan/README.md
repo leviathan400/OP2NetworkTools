@@ -44,8 +44,7 @@ Columns (like OP2's PICK SESSION): **Host IP**, **Game (creator)**, **Max Player
 - We read the host IP (datagram source), the game-creator name, the session GUID, the max
   players / scenario type, and the ping (echoed-token round-trip).
 
-Byte-exact spec: [`..\DISCOVERY_PROTOCOL.md`](../DISCOVERY_PROTOCOL.md). Design notes:
-[`..\NOTES.md`](../NOTES.md).
+Byte-exact spec: [`..\DISCOVERY_PROTOCOL.md`](../DISCOVERY_PROTOCOL.md).
 
 ## Files
 ```

@@ -36,7 +36,6 @@ where the protocol was cracked. Heavily diagnostic (toggle the per-packet dumps 
 - [`DISCOVERY_PROTOCOL.md`](DISCOVERY_PROTOCOL.md) - the UDP discovery query/reply wire spec.
 - [`JOIN_PROTOCOL.md`](JOIN_PROTOCOL.md) - early over-arching join + command-turn spec.
 - [`START_CHECKSUM.md`](START_CHECKSUM.md) - the game-start file checksum (why we can skip it).
-- [`NOTES.md`](NOTES.md) - discovery design notes.
 
 Each project folder has its own README with build + usage details.
 
