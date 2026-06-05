@@ -417,6 +417,8 @@ void Client::run(bool scan, std::string targetIp) {
     int  firstExec=0, maxExec=0, lookahead=0, gameTick=0, cppi=4, lastExec=0, maxSentMark=-1000000;
     uint64_t gameStartMs=0;
     bool chatActive=false; int chatMark=0; std::string chatText, lastRecvChat, lastLobbyChat;
+    // ally-back: if the host allies with us (command block type 0x32), ally back at a fresh mark
+    bool allyActive=false; int allyMark=0; std::string lastAllyData; uint8_t allyData[16]; int allyDataLen=0;
     long cmd0cSent=0, cmd0cRecv=0;
     bool glhfSent=false, quitSent=false;  // auto-greeting / lobby-quit one-shots
     uint64_t lastKeep=0, lastRecv=now_ms(), lastCmdTurnMs=0, leaveStartMs=0;
@@ -517,8 +519,9 @@ void Client::run(bool scan, std::string targetIp) {
                     if (!msg.empty()) { chatActive = true; chatMark = maxSentMark + cppi; chatText = msg; addChat(myName, msg, true); }
                 }
                 if (chatActive && execTick > chatMark) chatActive = false;
+                if (allyActive && execTick > allyMark) allyActive = false;
 
-                uint8_t ob[400]; int ol=0; bool injected=false; int off=0x18, idx=0;
+                uint8_t ob[400]; int ol=0; bool injectedChat=false, injectedAlly=false; int off=0x18, idx=0;
                 while (off + 6 <= n) {
                     uint8_t blen = buf[off+1];
                     if (off + 6 + (int)blen > n) break;
@@ -529,12 +532,33 @@ void Client::run(bool scan, std::string targetIp) {
                         const char* txt = (const char*)(buf + off + 6 + 2);
                         if (lastRecvChat != txt) { lastRecvChat = txt; std::string gn; { std::lock_guard<std::mutex> lk(mtx_); gn = state_.gameName; } addChat(gn.empty()?"host":gn, txt, false); }
                     }
+                    // incoming host ALLY block (command type 0x32, `AllyWith`/FUN_0040E300). In a
+                    // 2-player game any ally from the host targets us -> ally back. The 4-byte data
+                    // is two u16 player fields; our perspective is the fields swapped. (Bytes are
+                    // logged so the exact layout can be confirmed against a live ally.)
+                    if (buf[off]==0x32 && blen>=4 && blen<=12) {
+                        std::string d((const char*)(buf+off+6), blen);
+                        if (lastAllyData != d) {
+                            lastAllyData = d;
+                            char hex[40]={0}; for (int z=0; z<blen && z<12; z++) snprintf(hex+z*3, 4, "%02x ", buf[off+6+z]);
+                            debug_log(std::string("incoming ALLY (0x32) data: ") + hex);
+                            allyDataLen = blen; memcpy(allyData, buf+off+6, blen);
+                            uint16_t f0 = rd16(buf+off+6), f1 = rd16(buf+off+8);   // swap the two player fields
+                            wr16(allyData, f1); wr16(allyData+2, f0);
+                            allyActive = true; allyMark = maxSentMark + cppi;
+                            addChat("", "*** A PLAYER ALLIED WITH US - allying back ***", false);
+                        }
+                    }
                     if (ol + 64 <= (int)sizeof(ob)) {
-                        if (chatActive && !injected && blockMark==chatMark && unk!=0) {
+                        if (chatActive && !injectedChat && blockMark==chatMark && unk!=0) {
                             int tl=(int)chatText.size(), dl=2+tl+1;
                             ob[ol]=0x30; ob[ol+1]=(uint8_t)dl; wr32(ob+ol+2, unk);
                             ob[ol+6]=ourPlayerNum; ob[ol+7]=0xFF; memcpy(ob+ol+8, chatText.data(), tl); ob[ol+8+tl]=0;
-                            ol += 6+dl; injected=true;
+                            ol += 6+dl; injectedChat=true;
+                        } else if (allyActive && !injectedAlly && blockMark==allyMark && unk!=0) {
+                            ob[ol]=0x32; ob[ol+1]=(uint8_t)allyDataLen; wr32(ob+ol+2, unk);
+                            memcpy(ob+ol+6, allyData, allyDataLen);
+                            ol += 6+allyDataLen; injectedAlly=true;
                         } else { ob[ol]=0; ob[ol+1]=0; wr32(ob+ol+2, unk); ol += 6; }
                     }
                     off += 6 + blen; idx++;
@@ -543,6 +567,10 @@ void Client::run(bool scan, std::string targetIp) {
                 if (ol < 6) { ob[0]=0; ob[1]=0; wr32(ob+2, 0xBABE3624u); ol = 6; }
                 send_cmd0c((uint32_t)execTick, ob, ol);
                 cmd0cSent++;
+                if (injectedAlly) {
+                    char hex[40]={0}; for (int z=0; z<allyDataLen && z<12; z++) snprintf(hex+z*3, 4, "%02x ", allyData[z]);
+                    debug_log(std::string("sent ally-back (0x32) data: ") + hex + " at mark " + std::to_string(allyMark));
+                }
 
                 std::lock_guard<std::mutex> lk(mtx_);
                 state_.gameTick = gameTick;

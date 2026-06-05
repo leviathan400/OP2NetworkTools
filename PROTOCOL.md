@@ -223,7 +223,7 @@ The host shows it as "<name>: <message>" and relays to other players.
 
 ---
 
-## 7. Lobby state - GameStartInfo (191 B / 0xBF) - FULLY DECODED
+## 7. Lobby state - GameStartInfo (191 B / 0xBF)
 The settings blob, broadcast as **engine cmd 1** during the lobby (and cmd-7/8 at start).
 It's a copy of the lobby-window object from `window+0xC8`, so **blob offset N = window
 offset 0xC8 + N**, and on the wire **the blob starts at `0x13`** (after the 5-byte GUR
