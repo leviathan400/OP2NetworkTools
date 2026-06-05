@@ -1,0 +1,16 @@
+# build output
+/build/
+/out/
+/cmake-build-*/
+
+# MSVC / object files
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# editor / IDE
+.vs/
+.idea/
+.cache/
+compile_commands.json

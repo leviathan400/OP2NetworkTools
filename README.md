@@ -9,3 +9,8 @@ Network tools for Outpost 2.
 # OP2DummyPlayer
 
 ![Screenshot](https://images.outpostuniverse.org/OP2DummyPlayer.png)
+
+# OP2Session
+
+![Screenshot](https://images.outpostuniverse.org/OP2Session.png)
+
