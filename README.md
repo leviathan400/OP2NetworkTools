@@ -28,16 +28,11 @@ The same multiplayer client as a single-file Windows console tool - the research
 where the protocol was cracked. Heavily diagnostic (toggle the per-packet dumps via its
 `op2session.ini`). -> [`OP2Session/README.md`](OP2Session/README.md)
 
-### op2finder / op2finder-py
-C/Winsock console and Python implementations of the LAN discovery scanner.
--> [`op2finder/README.md`](op2finder/README.md), [`op2finder-py/README.md`](op2finder-py/README.md)
-
 ## Reference docs (repo root)
 - [`PROTOCOL.md`](PROTOCOL.md) - the multiplayer protocol, byte-exact: discover -> join ->
   lobby -> start -> in-game command turns + chat.
 - [`NETWORK_PROTOCOL.md`](NETWORK_PROTOCOL.md) - deeper synthesis of the networking functions
   (stack layers, GurManager reliability, lobby state machine, packet formats).
-- [`FINDINGS.md`](FINDINGS.md) - the reverse-engineering journey, gotchas, and lessons.
 - [`DISCOVERY_PROTOCOL.md`](DISCOVERY_PROTOCOL.md) - the UDP discovery query/reply wire spec.
 - [`JOIN_PROTOCOL.md`](JOIN_PROTOCOL.md) - early over-arching join + command-turn spec.
 - [`START_CHECKSUM.md`](START_CHECKSUM.md) - the game-start file checksum (why we can skip it).
