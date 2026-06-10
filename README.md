@@ -28,7 +28,14 @@ The same multiplayer client as a single-file Windows console tool - the research
 where the protocol was cracked. Heavily diagnostic (toggle the per-packet dumps via its
 `op2session.ini`). -> [`OP2Session/README.md`](OP2Session/README.md)
 
-## Reference docs (repo root)
+### OP2SessionLogger
+
+A developer tool (same Dear ImGui base as OP2DummyPlayer) that joins a game like a player and
+**logs decoded in-game command packets** to a text file - a command-type census plus a per-command
+decode (type, unit selection, known fields, undecoded tail) for reverse-engineering the command
+set. -> [`OP2SessionLogger/README.md`](OP2SessionLogger/README.md)
+
+## Reference Documents
 - [`PROTOCOL.md`](PROTOCOL.md) - the multiplayer protocol, byte-exact: discover -> join ->
   lobby -> start -> in-game command turns + chat.
 - [`NETWORK_PROTOCOL.md`](NETWORK_PROTOCOL.md) - deeper synthesis of the networking functions
@@ -41,4 +48,7 @@ Each project folder has its own README with build + usage details.
 
 ## Status
 Verified live against Outpost 2 host: LAN discovery, full join->play pipeline, two-way
-lobby and in-game chat, and a stable lockstep match with the external client as Player 2.
+lobby and in-game chat, a stable lockstep match with the external client as a player, a clean
+in-game leave (ctQuit, so the host removes the bot without a drop-timeout), and **multi-peer
+(3+ player) games** - the bot broadcasts its command turns to every peer and shows all players'
+chat. A 3-player match ran past 3400 ticks with the bot as a full player.

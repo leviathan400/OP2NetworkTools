@@ -106,12 +106,12 @@ cmake --build build
 3. Click START on the host. The bot follows the handshake; in-game stats and chat start updating.
 4. Click **Disconnect** (or close the window) to leave cleanly.
 
-## Notes & limitations
+## Notes & Limitations
 - Verified against **retail 1.3.6** on a LAN; OPU 1.4.1 shares the wire format.
 - **Multi-peer (3+ players) supported.** Gameplay is peer-to-peer, so the bot parses the cmd-4
   roster into a peer table and broadcasts its command turns (dst 0, flags 0x00) to every peer,
   and reads chat + leaves from every player's turn. Verified live in a 3-player match (ran past
-  3400 ticks, all players' chat shown, clean "X has left the game"). See `..\FINDINGS.md` #17.
+  3400 ticks, all players' chat shown, clean "X has left the game").
 - Firewall: allow the app (or inbound UDP on 47776-47807), same as Outpost 2 itself.
 - The bot is an **idle (passive) player**: it keeps the lockstep alive with empty command
   turns and chats, but issues no gameplay commands. The file checksum is skipped (it is a
@@ -121,6 +121,5 @@ cmake --build build
   passive client can't tell those apart from an eject on the wire.
 - `winbuild.bat` hard-codes a VS install path; adjust it for your machine, or use the generic
   CMake commands above.
-- Protocol reference: `..\PROTOCOL.md` (byte-exact) and `..\FINDINGS.md`
-  (the reverse-engineering journey, including the in-game chat fresh-mark gotcha).
+- Protocol reference: `..\PROTOCOL.md` (byte-exact)
 - Parked future ideas (in-game actions, hosting games) are noted in `IDEAS.md`.
