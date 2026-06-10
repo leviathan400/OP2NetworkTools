@@ -105,6 +105,37 @@ static std::string decode_cmd(uint8_t type, const uint8_t* d, int len) {
         snprintf(b, sizeof(b), " to=(%u,%u)%s", x & 0x7fff, y, (x & 0x8000) ? " [unit-target?]" : "");
         out += b; off += 6;
     }
+    // ctMoBuild: after the selection (the dozer), [u16 01]=const, [u16 X][u16 Y] target coord,
+    // [u16 x1,y1,x2,y2] tile-rect footprint, then an ff ff terminator (FINDINGS "decoded live").
+    if (type == 0x06 && off + 14 <= len) {
+        snprintf(b, sizeof(b), " at=(%u,%u) footprint=(%u,%u)-(%u,%u)",
+                 rd16(d+off+2), rd16(d+off+4),
+                 rd16(d+off+6), rd16(d+off+8), rd16(d+off+10), rd16(d+off+12));
+        out += b; off += 14;
+        if (off + 2 <= len && d[off]==0xff && d[off+1]==0xff) off += 2;  // terminator; show as tail if absent
+    }
+    // ctMoResearch: after the lab unit id, [u16 techIndex][u16 scientists].
+    if (type == 0x16 && off + 4 <= len) {
+        snprintf(b, sizeof(b), " tech=%u scientists=%u", rd16(d+off), rd16(d+off+2));
+        out += b; off += 4;
+    }
+    // ctMoTransferCargo: after the unit id, [u16 bayIndex] (a trailing unknown u16, observed 0,
+    // is left visible as tail).
+    if (type == 0x0a && off + 2 <= len) {
+        snprintf(b, sizeof(b), " bay=%u", rd16(d+off)); out += b; off += 2;
+    }
+    // ctMoBuildWall: after the selection (the Earthworker), [u16 x1,y1,x2,y2] tile rect to
+    // wall/tube + [u16 kind] (0x11 = tube, confirmed live). Trailing unknown u16 left as tail.
+    if (type == 0x07 && off + 10 <= len) {
+        snprintf(b, sizeof(b), " rect=(%u,%u)-(%u,%u) kind=%u",
+                 rd16(d+off), rd16(d+off+2), rd16(d+off+4), rd16(d+off+6), rd16(d+off+8));
+        out += b; off += 10;
+    }
+    // ctMoTrainScientists: after the university unit id, [u16 count] (confirmed live: 10 trained
+    // -> count=10).
+    if (type == 0x17 && off + 2 <= len) {
+        snprintf(b, sizeof(b), " count=%u", rd16(d+off)); out += b; off += 2;
+    }
     if (off < len) {
         out += " tail:";
         for (int i = off; i < len && i < off + 24; i++) { snprintf(b, sizeof(b), " %02x", d[i]); out += b; }

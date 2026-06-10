@@ -37,10 +37,11 @@ executor `FUN_0040e300` and its selection helpers `FUN_00490920` / `FUN_00490960
 **canonical** - the engine's own CommandType string table from the decompile (all 55 opcodes,
 `ctNop`..`WeaponFiring`). Field layouts decoded so far: **ctMoMove/ctMoDock** (`0x02`/`0x03`, with
 destination X,Y), **ctMoSelfDestruct** (`0x14`), **ctChat** (`0x30`), **ctQuit** (`0x31`),
-**ctAlly** (`0x32`), **ctMachineSettings** (`0x34`); decoded live pending one confirming capture:
-**ctMoBuild** (`0x06`, target X,Y + tile-rect footprint + `ff ff`), **ctMoResearch** (`0x16`,
-lab + techIndex + scientists), **ctMoTransferCargo** (`0x0a`, unit + bay). The full
-command-packet write-up - block structure,
+**ctAlly** (`0x32`), **ctMachineSettings** (`0x34`), **ctMoBuild** (`0x06`, target X,Y +
+tile-rect footprint + `ff ff`), **ctMoTrainScientists** (`0x17`, university + count); decoded
+live pending one confirming capture: **ctMoBuildWall** (`0x07`, tile rect + kind, 0x11 = tube),
+**ctMoResearch** (`0x16`, lab + techIndex + scientists), **ctMoTransferCargo** (`0x0a`, unit +
+bay). The full command-packet write-up - block structure,
 the unit-selection header, the type map, and the decoded layouts - is in [`FINDINGS.md`](FINDINGS.md).
 For the surrounding wire/transport protocol see `..\PROTOCOL.md` / `..\FINDINGS.md`.
 

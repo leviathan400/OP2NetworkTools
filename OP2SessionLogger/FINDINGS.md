@@ -134,22 +134,29 @@ move / dock / dock-EG (all selection + destination).
 - **`0x03` ctMoDock** - same layout as ctMoMove (`[selection]` `01 00` `X` `Y`). Observed live with
   the high bit of X set, consistent with docking AT a structure ("target is a unit") - nice
   confirmation of the unit-target flag theory.
-
-## Decoded live (field guess from 2 samples; one controlled capture to pin)
 - **`0x06` ctMoBuild** (len 19) - `[selection]`(the dozer) then:
   ```
   01 00          u16  constant (same token the move group carries)
-  X, Y           u16  target coordinate pair (same magnitude/scale as move destinations)
-  x1,y1,x2,y2    u16  tile rect = the structure FOOTPRINT (both live samples were 4x4)
+  X, Y           u16  target coordinate pair (pixels; X = (x2+0.5)*32 in all 3 captures,
+                      i.e. the centre of the footprint's right edge column - Y anchor TBD)
+  x1,y1,x2,y2    u16  tile rect = the structure FOOTPRINT
   ff ff          terminator
   ```
-  Live: `01 00 f0 07 08 07 3c 00 6d 00 3f 00 70 00 ff ff` -> rect (60,109)-(63,112);
-        `01 00 b0 06 38 07 32 00 70 00 35 00 73 00 ff ff` -> rect (50,112)-(53,115).
+  Confirmed live across structure types: footprints (60,109)-(63,112) and (43,10)-(46,13)
+  (both 4x4) vs (37,13)-(42,17) (6x5) - the rect tracks the structure size.
+- **`0x17` ctMoTrainScientists** (len 4) - `[u16 university unit] [u16 count]`.
+  Confirmed live: training 10 scientists -> `3b 00 0a 00` (university 59, count=10).
+
+## Decoded live (field guess; one controlled capture to pin)
+- **`0x07` ctMoBuildWall** (len 15) - `[selection]`(the Earthworker) then
+  `[u16 x1,y1,x2,y2]` tile rect to lay + `[u16 kind]` + `[u16 0?]`.
+  Live: `2e 00 11 00 30 00 12 00 11 00 00 00` -> rect (46,17)-(48,18), kind 0x11, while the
+  Earthworker was building a TUBE run (so kind 0x11 = tube; wall kinds still to capture).
 - **`0x16` ctMoResearch** (len 6) - `[u16 lab unit] [u16 techIndex] [u16 scientists]`.
   Live: `1c 00 1a 00 0b 00` (lab 28, tech 0x1a, 11 scientists) and
         `1c 00 1d 00 0a 00` (lab 28, tech 0x1d, 10 scientists) - tech + count both varied.
-- **`0x0a` ctMoTransferCargo** (len 6) - `[u16 unit] [u16 bayIndex?] [u16 0]`.
-  Live: `1a 00 02 00 00 00` and `1a 00 01 00 00 00` (same unit 26, bay 2 then bay 1).
+- **`0x0a` ctMoTransferCargo** (len 6) - `[u16 unit] [u16 bayIndex] [u16 0?]`.
+  Live: same unit with bay 1, 2 and 3 across sessions; trailing u16 always 0 so far.
 - **`0x34` ctMachineSettings** - two dwords, sent ~5/sec. The deterministic-sync / desync-check
   heartbeat. Not a player action; a passive client can omit it (send `ctNop`) and the game tolerates
   it.
@@ -162,8 +169,11 @@ move / dock / dock-EG (all selection + destination).
 - `0x09` **ctMoProduce** - structure-kit type id + a second ref (single-unit header).
 - `0x18` ctMoTransfer, `0x2b` ctGameOpt, and the rest of the selection+coordinate group
   (`0x27` cargo-route, `0x28` patrol).
-- Confirm the "decoded live" trio above: ctMoBuild (vary the structure type -> footprint),
-  ctMoResearch (same tech, different scientist counts), ctMoTransferCargo (which bay is which).
+- Confirm the "decoded live" trio above: ctMoBuildWall (capture a WALL run -> kind value vs
+  tube's 0x11), ctMoResearch (same tech, different scientist counts), ctMoTransferCargo
+  (which bay is which).
+- ctMoBuild's Y anchor: X = (x2+0.5)*32 holds in all captures; the Y pixel value doesn't map to
+  the rect as simply (structure-dependent vertical offset?).
 
 The decoder (`cmd_name` / `decode_cmd` in `src/net/op2client.cpp`) encodes the above; extend it as
 each command is pinned.
