@@ -19,7 +19,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName",      "Outpost Universe"
-            VALUE "FileDescription",  "OP2SessionLogger - external Outpost 2 multiplayer client"
+            VALUE "FileDescription",  "OP2SessionLogger"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "OP2SessionLogger"
             VALUE "LegalCopyright",   "Copyright (C) Outpost Universe"

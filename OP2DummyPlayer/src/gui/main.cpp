@@ -29,8 +29,30 @@ static ImVec4 op2_color(int c) {
     return ImVec4(0.7f,0.7f,0.7f,1);
 }
 
-int main(int, char**) {
+int main(int argc, char** argv) {
     op2::debug_log("=== OP2DummyPlayer started ===");
+
+    // Optional startup flags (so the app can be driven headlessly without clicking the GUI):
+    //   --scan / --autojoin   scan the LAN and join the first hosted game
+    //   --ip <addr>           join a specific host IP directly
+    //   --ver a.b.c.d         advertise this TApp::Version (default 1.4.0.1 for OPU 1.4.1; pass
+    //                         1.3.0.4 for retail 1.3.6). The host drops a peer whose version != its own.
+    //   --debug               self-test run: scan+join, post a "leaving" chat, leave cleanly, then exit.
+    bool autoScan = false, debugRun = false;
+    std::string autoIp;
+    uint32_t tappVer = 0;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--scan" || a == "--autojoin") autoScan = true;
+        else if (a == "--debug") { debugRun = true; autoScan = true; }
+        else if ((a == "--ip" || a == "--join") && i + 1 < argc) autoIp = argv[++i];
+        else if (a == "--ver" && i + 1 < argc) {
+            unsigned va=0,vb=0,vc=0,vd=0;
+            if (sscanf(argv[++i], "%u.%u.%u.%u", &va,&vb,&vc,&vd) == 4)
+                tappVer = ((va&0xff)<<24)|((vb&0xff)<<16)|((vc&0xff)<<8)|(vd&0xff);
+        }
+    }
+
     glfwSetErrorCallback(glfw_error);
     if (!glfwInit()) { op2::debug_log("FATAL: glfwInit failed"); fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)
@@ -54,12 +76,24 @@ int main(int, char**) {
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     op2::Client client;
+    if (tappVer) client.setTappVersion(tappVer);   // apply --ver before any connect
+
+    // Fire the requested auto-connect once, before the UI loop (the GUI still works normally after).
+    if (!autoIp.empty()) { op2::debug_log("auto-connect (cmdline): join " + autoIp); client.connectIp(autoIp); }
+    else if (autoScan)   { op2::debug_log("auto-connect (cmdline): scan LAN"); client.connectScan(); }
 
     // UI-owned input buffers
     static char nameBuf[16] = "OPU";
     static char ipBuf[64]   = "";
     static char chatBuf[128] = "";
     bool nameApplied = false;
+
+    // --debug self-test run (a tiny per-frame state machine driven below):
+    //   DBG_WAIT    -> waiting to reach the lobby (or to fail). On lobby: post a chat, go DBG_SENT.
+    //   DBG_SENT    -> +2 s (let the chat reliably send), then disconnect cleanly, go DBG_LEAVING.
+    //   DBG_LEAVING -> +0.3 s, then ask the window to close -> normal shutdown, go DBG_DONE.
+    enum { DBG_WAIT, DBG_SENT, DBG_LEAVING, DBG_DONE } dbgState = DBG_WAIT;
+    double dbgMark = 0.0;
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -69,6 +103,28 @@ int main(int, char**) {
 
         op2::ClientState st = client.snapshot();
         bool busy = client.running();
+
+        // --debug: drive the whole run, then close the window for a clean exit.
+        if (debugRun) {
+            double now = glfwGetTime();
+            bool inLobby = (st.phase == op2::Phase::InLobby || st.phase == op2::Phase::InGame);
+            if (dbgState == DBG_WAIT && inLobby) {
+                client.sendChat("Doing debug run, Leaving");
+                op2::debug_log("[debug] joined - posted leaving chat");
+                dbgMark = now; dbgState = DBG_SENT;
+            } else if (dbgState == DBG_WAIT && (st.phase == op2::Phase::Error || st.disconnected)) {
+                if (dbgMark == 0.0) dbgMark = now;                    // join failed - hold briefly then close
+                if (now - dbgMark > 1.5) { op2::debug_log("[debug] join failed - closing"); glfwSetWindowShouldClose(win, 1); }
+            } else if (dbgState == DBG_SENT && now - dbgMark > 2.0) {
+                op2::debug_log("[debug] leaving cleanly");
+                client.disconnect();                                  // clean lobby/in-game quit, joins worker
+                dbgMark = now; dbgState = DBG_LEAVING;
+            } else if (dbgState == DBG_LEAVING && now - dbgMark > 0.3) {
+                op2::debug_log("[debug] done - closing app");
+                glfwSetWindowShouldClose(win, 1);                     // clean window-close -> normal shutdown
+                dbgState = DBG_DONE;
+            }
+        }
 
         // one full-window panel
         const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -121,6 +177,10 @@ int main(int, char**) {
             ImGui::Text("Host IP:  %s", st.hostIp.c_str());
             ImGui::Text("Game:     %s", st.gameName.c_str());
             ImGui::Text("Map DLL:  %s", st.lobby.mapDll.c_str());
+            if (st.lobby.tappVersion) {
+                uint32_t v = st.lobby.tappVersion;
+                ImGui::Text("Host Ver: %u.%u.%u.%u", (v>>24)&0xff, (v>>16)&0xff, (v>>8)&0xff, v&0xff);
+            }
             if (st.ourColor >= 0) {
                 ImGui::Text("Our Color:"); ImGui::SameLine();
                 ImGui::TextColored(op2_color(st.ourColor), "%s", op2::color_name(st.ourColor));

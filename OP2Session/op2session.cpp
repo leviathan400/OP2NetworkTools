@@ -1,4 +1,7 @@
-// op2session.exe - experimental Outpost 2 (retail 1.3.6) multiplayer client.
+// OP2Session
+// https://github.com/leviathan400/OP2NetworkTools
+//
+// Experimental Outpost 2 multiplayer client.
 //
 // Speaks OP2's own network protocol from scratch (no game engine) to join and PLAY a
 // hosted multiplayer game. Full pipeline, all verified live against a retail 1.3.6 host:
@@ -63,9 +66,10 @@ static const uint8_t GAME_GUID[16] = {
 };
 
 // Local IPv4 (network order), the way OP2 picks it: gethostname -> gethostbyname[0],
-// skipping loopback. Binding the game socket to THIS ip (not INADDR_ANY) is required so
-// that, on the same machine as the host, our port scan skips the host's 47800 and our
-// replies aren't stolen by the host's more-specific binding.
+// skipping loopback. We bind the game socket to THIS ip (not INADDR_ANY), and additionally skip
+// the host's port 47800 outright when we're on the same machine as the host (see the bind loop) -
+// a 1.4.1 host binds 47800 to INADDR_ANY, so a specific-IP bind to it would otherwise SUCCEED and
+// steal our own replies.
 static uint32_t get_local_ip() {
     char host[256];
     if (gethostname(host, sizeof(host)) != 0) return 0;
@@ -244,6 +248,7 @@ static void decode_packet(const uint8_t* d, int n, const char* srcdesc) {
 // 5-byte GUR sub-header). Field map RE'd from MultiplayerPreGameSetupWnd (blob N = win 0xC8+N).
 struct LobbyState {
     bool valid;
+    uint32_t tappVersion;   // host TApp::Version from the GSI blob (b+0x04)
     int maxp, initVeh, speed;
     bool disasters, dayNight, morale;
     char mapdll[33];
@@ -255,6 +260,7 @@ static LobbyState parse_gsi(const uint8_t* p, int n) {
     if (n < 0x13 + 0xBA) return s;
     const uint8_t* b = p + 0x13;
     uint32_t flags = rd32(b + 0x00);
+    s.tappVersion = rd32(b + 0x04);   // host TApp::Version (e.g. 0x01030004 = "1.3.0.4")
     s.maxp = (flags>>6)&7; s.initVeh = (flags>>17)&0xf; s.speed = rd16(b+0xAE)>>2;
     s.disasters=(flags&1)!=0; s.dayNight=(flags&2)!=0; s.morale=(flags&4)!=0;
     memcpy(s.mapdll, b+0x10, 32);
@@ -326,6 +332,23 @@ int main(int argc, char** argv) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2,2), &wsa)) { printf("WSAStartup failed\n"); return 1; }
 
+    // Args: an optional host IP (positional) and `--ver a.b.c.d` to set the advertised TApp::Version.
+    // Default 1.4.0.1 joins OPU 1.4.1; pass `--ver 1.3.0.4` for retail 1.3.6. The host ejects a peer
+    // whose advertised version != its own, and we must send ours (cmd-3) before the GSI reveals theirs.
+    uint32_t tappVer = 0x01040001;
+    const char* ipArg = nullptr;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ver") == 0 && i + 1 < argc) {
+            unsigned a=0,b=0,c=0,d=0;
+            if (sscanf(argv[++i], "%u.%u.%u.%u", &a,&b,&c,&d) == 4)
+                tappVer = ((a&0xff)<<24)|((b&0xff)<<16)|((c&0xff)<<8)|(d&0xff);
+        } else if (argv[i][0] != '-') {
+            ipArg = argv[i];
+        }
+    }
+    printf("Advertising TApp version %u.%u.%u.%u\n",
+           (tappVer>>24)&0xff, (tappVer>>16)&0xff, (tappVer>>8)&0xff, tappVer&0xff);
+
     // ---- 1) ephemeral socket for discovery ----
     SOCKET ds = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     int yes = 1; setsockopt(ds, SOL_SOCKET, SO_BROADCAST, (char*)&yes, sizeof(yes));
@@ -334,9 +357,9 @@ int main(int argc, char** argv) {
     bind(ds, (sockaddr*)&any, sizeof(any));
 
     Game g;
-    if (argc > 1) {
+    if (ipArg) {
         memset(&g, 0, sizeof(g));
-        inet_pton(AF_INET, argv[1], &g.hostIp);
+        inet_pton(AF_INET, ipArg, &g.hostIp);
         memcpy(g.gameGuid, GAME_GUID, 16);
         // still discover to grab the session GUID/name
         Game d = discover(ds);
@@ -358,15 +381,41 @@ int main(int argc, char** argv) {
     SOCKET gs = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     to = 400; setsockopt(gs, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof(to));
     uint32_t localIp = get_local_ip();
-    { struct in_addr la2; la2.s_addr = localIp; printf("Binding game socket to local IP %s\n", localIp?inet_ntoa(la2):"(ANY)"); }
+    { struct in_addr la2; la2.s_addr = localIp; printf("Local IP %s\n", localIp?inet_ntoa(la2):"(ANY)"); }
+    // Bind the game socket to the first free port in 47800-47807, MATCHING THE HOST'S BIND STYLE so
+    // ports conflict cleanly instead of co-existing (on Windows a wildcard bind and a specific-IP bind
+    // to the same UDP port co-exist, and the most-specific socket silently STEALS the traffic):
+    //   - Host with NetHelper ON binds WILDCARD (0.0.0.0)   -> we bind WILDCARD too.
+    //   - Host with NetHelper OFF (vanilla) binds SPECIFIC-IP -> we bind SPECIFIC to our local IP.
+    // The determinant is NetHelper ON/OFF, NOT the game version, so we DETECT the host's style by probe:
+    // a throwaway WILDCARD bind to the host's game port (47800) FAILS if the host already holds it
+    // wildcard (NetHelper ON), SUCCEEDS if specific-bound (co-exists) or free (OFF). `--ver` is
+    // independent (game VERSION we advertise). When the host is on THIS machine we also skip 47800.
+    bool nethelper = false;
+    {
+        SOCKET probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (probe != INVALID_SOCKET) {
+            sockaddr_in pa; memset(&pa,0,sizeof(pa)); pa.sin_family=AF_INET;
+            pa.sin_addr.s_addr = INADDR_ANY; pa.sin_port = htons((u_short)GAME_PORT_LO);
+            nethelper = (bind(probe, (sockaddr*)&pa, sizeof(pa)) != 0);   // fails => host holds 47800 wildcard => NetHelper ON
+            closesocket(probe);
+        }
+    }
+    bool sameMachine = (localIp != 0 && localIp == g.hostIp);
+    uint32_t bindAddr = nethelper ? INADDR_ANY : (localIp ? localIp : INADDR_ANY);
+    int loPort = sameMachine ? GAME_PORT_LO + 1 : GAME_PORT_LO;
     uint16_t ourPort = 0;
-    for (int p = GAME_PORT_LO; p <= GAME_PORT_HI; p++) {
+    for (int p = loPort; p <= GAME_PORT_HI; p++) {
         sockaddr_in la; memset(&la,0,sizeof(la)); la.sin_family=AF_INET;
-        la.sin_addr.s_addr = localIp ? localIp : INADDR_ANY; la.sin_port=htons((u_short)p);
+        la.sin_addr.s_addr = bindAddr; la.sin_port=htons((u_short)p);
         if (bind(gs, (sockaddr*)&la, sizeof(la)) == 0) { ourPort=(uint16_t)p; break; }
     }
     if (!ourPort) { printf("Could not bind a game port 47800-47807\n"); WSACleanup(); return 1; }
-    printf("Our game socket bound to port %u\n\n", ourPort);
+    { struct in_addr ba; ba.s_addr = bindAddr;
+      printf("Our game socket bound to %s:%u [detected NetHelper %s - %s%s]\n\n",
+             bindAddr==INADDR_ANY ? "0.0.0.0" : inet_ntoa(ba), ourPort,
+             nethelper ? "ON" : "OFF", nethelper ? "wildcard" : "specific",
+             sameMachine ? ", same-machine skip 47800" : ""); }
 
     // ---- 3) send join request to host:47777, loop until reply ----
     sockaddr_in joinAddr; memset(&joinAddr,0,sizeof(joinAddr));
@@ -455,7 +504,7 @@ int main(int argc, char** argv) {
         p[0x0E] = 0x0A; p[0x0F] = ourSeqA;                     // flags chanA+ack, seq
         p[0x10] = ackA; p[0x11] = ackB;                        // ack host channels
         p[0x12] = 3;                                            // engine cmd 3 = ShowJoinGame
-        wr32(p+0x13, 0x01030004);                              // TApp::Version "1.3.0.4"
+        wr32(p+0x13, tappVer);                                  // TApp::Version (default 1.4.0.1, --ver)
         memcpy(p+0x17, PLAYER_NAME, nameLen);                  // name at payload+9
         wr32(p+0x0A, wire_cksum(p));
         sendto(gs,(char*)p,total,0,(sockaddr*)&dst,sizeof(dst));
@@ -555,7 +604,8 @@ int main(int argc, char** argv) {
         cmd0cSent++;
     };
 
-    printf("Raising status + sending cmd-3 ShowJoinGame (name='%s', version 1.3.0.4)...\n", PLAYER_NAME);
+    printf("Raising status + sending cmd-3 ShowJoinGame (name='%s', version %u.%u.%u.%u)...\n",
+           PLAYER_NAME, (tappVer>>24)&0xff, (tappVer>>16)&0xff, (tappVer>>8)&0xff, tappVer&0xff);
     send_status(replyFrom, 2);   // join-ack to the reply source (47783) -> progresses host to lobby
     send_status(gameAddr, 2);    // raise status on the game socket
     send_cmd3(gameAddr);
@@ -563,6 +613,7 @@ int main(int argc, char** argv) {
     DWORD start = GetTickCount(), lastKeep = 0, lastTick = 0, lastRecv = GetTickCount(); int hb = 0;
     uint8_t last[1300]; int lastn = 0, dupCount = 0;
     LobbyState prevLobby; prevLobby.valid = false;
+    bool hostVerShown = false;   // print the host's TApp version (+ mismatch warning) once
     bool gameStarting = false, gameLive = false;
     // ---- in-game clock + duration timer ----
     // We do NOT run the simulation, so we cannot derive the tick from game logic. Instead we
@@ -603,6 +654,14 @@ int main(int argc, char** argv) {
             if (buf[0x09] == 0 && buf[0x08] == 0xBF && n >= 0xCD && buf[0x12] == 1) {
                 LobbyState cur = parse_gsi(buf, n);
                 if (cur.valid) {
+                    if (!hostVerShown && cur.tappVersion) {
+                        hostVerShown = true;
+                        printf("Host TApp version %u.%u.%u.%u (0x%08X)%s\n",
+                               (cur.tappVersion>>24)&0xff, (cur.tappVersion>>16)&0xff,
+                               (cur.tappVersion>>8)&0xff, cur.tappVersion&0xff, cur.tappVersion,
+                               (cur.tappVersion != tappVer)
+                                 ? "  *** MISMATCH - host will eject us; pass --ver to match ***" : "");
+                    }
                     if (!prevLobby.valid) print_lobby(cur, scen_name(g.scenType));
                     else if (!lobby_eq(prevLobby, cur)) diff_lobby(prevLobby, cur);
                     prevLobby = cur;

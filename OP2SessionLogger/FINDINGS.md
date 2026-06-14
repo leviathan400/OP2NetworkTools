@@ -6,7 +6,11 @@ command-data layer, distinct from the wire/transport protocol in `..\PROTOCOL.md
 `..\FINDINGS.md`.
 
 ## Method
-Two sources, cross-checked:
+Three sources, cross-checked:
+- **Spec doc** (authoritative): the engine's `DataStructure CommandPacket.txt` gives the wire header
+  (CommandPacket / NetworkCommandPacket) and the per-type data layouts. Opcode->name comes from the
+  CommandType string table (`OP2KB-FULL\data\command_packet_opcodes.tsv`, string VAs
+  `0x004e0f10`-`0x004e11fc`). This is now the primary reference; the live captures confirm it.
 - **Decompile** (retail 1.3.6): the command **executor** `FUN_0040e300` is one big
   `switch(commandType)` - it defines every command type and what each handler reads. Its
   unit-selection helpers `FUN_00490920` (count) and `FUN_00490960` (id list) define the command
@@ -24,26 +28,37 @@ Two capture rules that make decoding tractable:
   repeats are its variable fields.
 
 ## Command block structure
-Each command in the `0x0C` stream is:
+Each command in the `0x0C` stream is (this is the engine's **NetworkCommandPacket** per-command
+form, confirmed against the official `DataStructure CommandPacket.txt`):
 ```
-+0  u8   type        the executor switch case
-+1  u8   len         length of data[]
-+2  u32  unk         a per-stream constant token (observed 0xBABE3624); MUST be non-zero or the
-                     receiver discards the block. It is not a per-command id - mirror it verbatim.
++0  u8   type        the executor switch case (messageType)
++1  u8   len         dataLength of data[]
++2  u32  unk         the doc's "Unknown" field. A per-stream constant token (observed 0xBABE3624);
+                     MUST be non-zero or the receiver discards the block. Mirror it verbatim.
 +6  data[len]        command-specific (see below)
 ```
+The engine's **internal** CommandPacket header is wider (`u32 messageType, u16 dataLength,
+u32 timeStamp, u32 Unknown`); the wire form packs type+len into one byte each and shares the same
+`Unknown`. We only ever see/emit the wire form.
 
 ### The data header is a unit selection
 `data` begins with a unit selection, decoded by the executor's helpers:
 ```
-+0  s8   selectionCount   > 0  = N explicitly selected units; N u16 ids follow at +1
++0  s8   selectionCount   > 0  = N explicitly selected units (doc: numUnits); N u16 ids follow at +1
                           <= 0 = a reference to a saved control-group / select-all
 +1  u16 x N   the selected unit ids   (when count > 0)
 +...          command-specific fields follow the id list
 ```
 Some commands instead take a **single** `u16` unit id at `+0` (the executor cases that read
-`*(short*)data` directly, e.g. build/dock). This is why command length varied in early captures -
-it was just different numbers of selected units (`sel=[18]` vs `sel=[19,18,17]`).
+`*(short*)data` directly, e.g. produce/transfer-cargo/research). This is why command length varied
+in early captures - it was just different numbers of selected units (`sel=[18]` vs `sel=[19,18,17]`).
+
+### Packed map coordinates
+Waypoint/destination coordinates are a **single u32**, not two u16s: `pixelX` in the low 15 bits,
+`pixelY` in the next 14 (doc: "pixelX:15 [low], pixelY:14 [high]"). At 32 px/tile, `tile = pixel/32`.
+An earlier reading split it into two u16s, which **halved every logged Y** and mistook `pixelY`'s
+low bit for a bogus "unit-target" flag on X - both now fixed. Tile **rects** (build footprints,
+bulldoze/tube regions) are instead four plain u16 tile coords `x1,y1,x2,y2`.
 
 ## Command-type map (canonical names)
 The opcode -> name map is **canonical**, from the engine's own CommandType string table in the
@@ -113,70 +128,94 @@ move / dock / dock-EG (all selection + destination).
 | `0x35` | ctInvalidCommand | - |
 | `0x36` | WeaponFiring | - |
 
-## Decoded commands (confirmed live)
+## Decoded commands (spec layout, cross-checked live)
+All layouts below now match the official `DataStructure CommandPacket.txt`; the ones marked
+"live" were also observed on the wire and agree byte-for-byte.
 - **`0x00` ctNop** - empty turn, `len 0`. Keepalive / lockstep filler.
-- **`0x02` ctMoMove / `0x03` ctMoDock** - `[selection]` then `01 00`(u16, constant) `X`(u16) `Y`(u16) = the
-  destination. The **high bit of X (`& 0x8000`)** appears to flag "target is a unit" vs a bare map
-  tile (the executor does the same `& 0x80000000` test). Confirmed: the same unit moved to different
-  tiles changes only X,Y.
+- **`0x02` ctMoMove / `0x03` ctMoDock / `0x04` ctMoDockEG / `0x26` ctMoStandGround** -
+  `[selection]` then `[u16 numWayPoints]` and that many **packed coords** (`pixelX:15 | pixelY:14`,
+  see "Packed map coordinates"). Live moves carry `numWayPoints=1`. Correcting the old note: the
+  `01 00` we called a "constant" is `numWayPoints`, and there is no "unit-target" flag - that was
+  `pixelY`'s low bit leaking out of the broken two-u16 split.
   ```
-  move sel=[19] 01 00 | 23 05 | 4f 00   -> to=(0x0523, 0x004f)
-  move sel=[13] 01 00 | 56 85 | 5b 00   -> to=(0x0556, 0x005b) high bit set
+  ctMoMove sel=[29]  01 00 | 47 87 32 07   dest u32=0x07328747 -> pixel (1863, 3685)  tile ~(58,115)
   ```
-  (Whether X/Y are tiles, pixels, or a scaled coordinate is not yet calibrated.)
-- **`0x14` ctMoSelfDestruct** - `[selection]`, no other data. Confirmed: self-destructing N units emits
-  exactly N x `0x14`, one per unit (`sel=[17] sel=[18] sel=[19] sel=[13]`).
-- **`0x30` ctChat** - `[sender(1), recipientMask(1), text..., NUL]`. Display gated on
-  `(1 << localPlayer) & recipientMask`. e.g. `00 ff 62 79 65 00` = sender 0, all, "bye".
-- **`0x31` ctQuit** - 1 byte mode (`mode=2` observed on a normal leave). Triggers the host's net
-  shutdown / "player has quit" path.
-- **`0x32` ctAlly** - 1 byte target player. Toggles the alliance bitmask.
-- **`0x03` ctMoDock** - same layout as ctMoMove (`[selection]` `01 00` `X` `Y`). Observed live with
-  the high bit of X set, consistent with docking AT a structure ("target is a unit") - nice
-  confirmation of the unit-target flag theory.
-- **`0x06` ctMoBuild** (len 19) - `[selection]`(the dozer) then:
-  ```
-  01 00          u16  constant (same token the move group carries)
-  X, Y           u16  target coordinate pair (pixels; X = (x2+0.5)*32 in all 3 captures,
-                      i.e. the centre of the footprint's right edge column - Y anchor TBD)
-  x1,y1,x2,y2    u16  tile rect = the structure FOOTPRINT
-  ff ff          terminator
-  ```
-  Confirmed live across structure types: footprints (60,109)-(63,112) and (43,10)-(46,13)
-  (both 4x4) vs (37,13)-(42,17) (6x5) - the rect tracks the structure size.
-- **`0x17` ctMoTrainScientists** (len 4) - `[u16 university unit] [u16 count]`.
-  Confirmed live: training 10 scientists -> `3b 00 0a 00` (university 59, count=10).
+- **`0x06` ctMoBuild** (len 19) - `[selection]`(the dozer), `[u16 numWayPoints]`, the packed
+  waypoint coord(s), then the build area as four u16 tiles `x1,y1,x2,y2`, then `FF FF` (stored to
+  `unit+0x6A`). Confirmed live across structure types: footprints (43,10)-(46,13) (4x4) vs
+  (37,13)-(42,17) (6x5) - the rect tracks the structure size, and the waypoint pixel lands on the
+  footprint's bottom-right corner (this is what the old "Y anchor TBD" note was chasing - it was the
+  halved-Y bug, now fixed).
+- **`0x07` ctMoBuildWall** (len 15) - `[selection]`(Earthworker), region rect as four u16 tiles, then
+  `[u16 map_id kind]`, then `00 00`. The rect is **TopLeft-inclusive, BottomRight-exclusive** (spec:
+  "including tube" / "excluding tube"), so tile span = `(x2-x1) x (y2-y1)`. Ground-truth confirmed:
+  a player who laid 4 wall tiles + 2 tube tiles produced exactly three commands - two `kind=0x12`
+  rects of 1x2 and one `kind=0x11` rect of 1x2. map_id kinds pinned so far: **`0x11` = tube,
+  `0x12` = wall**; microbe-wall and lava-wall ids still to capture.
+- **`0x0a` ctMoTransferCargo** (len 6) - `[u16 buildingUnit] [u16 bay] [u16 0000]`. Live: same
+  building with bay 1/2/3 across sessions; trailing u16 is a confirmed constant `0000`.
+- **`0x14` ctMoSelfDestruct** - `[selection]`, no other data. Live: self-destructing N units emits
+  exactly N x `0x14`, one per unit.
+- **`0x16` ctMoResearch** (len 6) - `[u16 lab] [u16 techNum] [u16 numScientists]`. Live:
+  `1c 00 1a 00 0b 00` (lab 28, tech 0x1a, 11 sci) and `1c 00 1d 00 0a 00` (lab 28, tech 0x1d, 10 sci).
+- **`0x17` ctMoTrainScientists** (len 4) - `[u16 university] [u16 numTrained]`. Live: training 10 ->
+  `3b 00 0a 00` (university 59, count 10).
+- **`0x30` ctChat** - `[srcPlayer(1), destMask(1), text..., NUL]`. Display gated on
+  `(1 << localPlayer) & destMask`. e.g. `00 ff 62 79 65 00` = sender 0, all, "bye".
+- **`0x31` ctQuit** (len 2) - `[u8 quitMethod, u8 lParam]`. quitMethod `0`=self-destruct,
+  `1`=transfer-to-allies, other=go-AI. Live: `02 02` on the host's normal leave (so it actually
+  hands off to AI, not a plain disconnect).
+- **`0x32` ctAlly** (len 4) - `[u16 allyFromPlayer, u16 allyToPlayer]` (each written as 2 bytes; the
+  engine reads 1). Earlier "1 byte target player" was wrong - the target is the **second** field;
+  the first is the sender. (Our ally-back already swaps both fields, which the spec confirms.)
+- **`0x34` ctMachineSettings** (len 8) - `[u16 cpuSpeed(MHz), u16 physMem(MB), u16 winW, u16 winH]`,
+  sent ~5/sec as the desync-check heartbeat. Live `e6 0a 00 08 60 04 00 03` = 2790 MHz, 2048 MB,
+  1120x768. Not a player action; a passive client can send `ctNop` instead and the game tolerates it.
 
-## Decoded live (field guess; one controlled capture to pin)
-- **`0x07` ctMoBuildWall** (len 15) - `[selection]`(the Earthworker) then
-  `[u16 x1,y1,x2,y2]` tile rect to lay + `[u16 kind]` + `[u16 0?]`.
-  Live: `2e 00 11 00 30 00 12 00 11 00 00 00` -> rect (46,17)-(48,18), kind 0x11, while the
-  Earthworker was building a TUBE run (so kind 0x11 = tube; wall kinds still to capture).
-- **`0x16` ctMoResearch** (len 6) - `[u16 lab unit] [u16 techIndex] [u16 scientists]`.
-  Live: `1c 00 1a 00 0b 00` (lab 28, tech 0x1a, 11 scientists) and
-        `1c 00 1d 00 0a 00` (lab 28, tech 0x1d, 10 scientists) - tech + count both varied.
-- **`0x0a` ctMoTransferCargo** (len 6) - `[u16 unit] [u16 bayIndex] [u16 0?]`.
-  Live: same unit with bay 1, 2 and 3 across sessions; trailing u16 always 0 so far.
-- **`0x34` ctMachineSettings** - two dwords, sent ~5/sec. The deterministic-sync / desync-check
-  heartbeat. Not a player action; a passive client can omit it (send `ctNop`) and the game tolerates
-  it.
+## From the spec, not yet seen live (decoder pre-loaded)
+The decoder now also renders these straight from the spec, so the next capture self-documents:
+- **`0x01` ctMoDoze** - `[selection]` + bulldoze rect (4 u16 tiles).
+- **`0x08` ctMoRemoveWall** - `[selection]` + waypoints + tube rect (4 u16 tiles).
+- **`0x09` ctMoProduce** (len 8) - `[u16 factory, u16 itemToProduce(map_id), u16 weaponType(map_id),
+  s16 scStubIndex(-1=none)]`.
+- **`0x19` ctMoLaunch** (len 6) - `[u16 unit, u16 destPixelX, u16 destPixelY]` (note: **plain** u16
+  pixels here, not the packed form the move group uses).
+- **`0x1c/0x1d/0x1e` ctMoRepairObj/Reprogram/Dismantle** and **`0x24/0x25` ctMoAttackObj/Guard** -
+  `[selection] 0000 [u16 target] [u16 FFFF|tileY]`; `FFFF` => target is a unit, else target is a
+  ground tile `(tileX, tileY)`.
+- **`0x20` ctMoCreate** - `[u16 numUnits]` + `CreateUnitInfo[12]{u32 type, u16 tileX, u16 tileY,
+  u32 weaponOrCargo}` (the scenario/cheat unit spawner).
+- **`0x23` ctMoLightToggle** - `[selection] [u16 headLightState]` (0 off / 1 on).
+- **`0x2b` ctGameOpt** - `[u16 ?, u16 variableId, u16 newValue, (u16 player)]`; variableId 8-32 set
+  resources / morale / disasters / game speed, and id `0x22 TickOfLastSetGameOpt != 0` is the engine's
+  "CHEATED GAME!" flag.
+
+## Host game version (GameStartInfo blob)
+The host's **TApp::Version** is in the GameStartInfo blob (engine cmd 1) at **blob `+0x04`**
+(wire offset `0x17`), a u32 right after the flags dword at `+0x00`. Confirmed live: a retail 1.3.6
+host broadcasts `04 00 03 01` = `0x01030004` = "1.3.0.4". It is NOT in the discovery reply or the
+join-accept (both dumped and checked), and the host does not send a `cmd-3` player-announce back, so
+the GSI is the only lobby source. `parse_gsi` exposes it as `LobbyInfo.tappVersion`; the client logs
+it and posts it to chat ("Host game version: 1.3.0.4") and the lobby panel shows "Host Ver". Use this
+to compare a 1.4.1 host (which drops our 1.3.0.4-advertising client) against a 1.3.6 host.
 
 ## Background vs player input
 - **Background** (fires even when idle): `0x00 ctNop`, `0x34` sync.
 - **Player input**: everything else. The engine sim never puts its events on the wire.
 
-## Still to decode (names now canonical; field layouts still open)
-- `0x09` **ctMoProduce** - structure-kit type id + a second ref (single-unit header).
-- `0x18` ctMoTransfer, `0x2b` ctGameOpt, and the rest of the selection+coordinate group
-  (`0x27` cargo-route, `0x28` patrol).
-- Confirm the "decoded live" trio above: ctMoBuildWall (capture a WALL run -> kind value vs
-  tube's 0x11), ctMoResearch (same tech, different scientist counts), ctMoTransferCargo
-  (which bay is which).
-- ctMoBuild's Y anchor: X = (x2+0.5)*32 holds in all captures; the Y pixel value doesn't map to
-  the rect as simply (structure-dependent vertical offset?).
+## Still to decode / confirm
+- **Calibrate the map_id enums against live values**: ctMoBuildWall `kind` (tube=0x11 seen; capture a
+  wall / microbe-wall / lava-wall), ctMoProduce `item`/`weapon`, ctMoCreate `type`.
+- **ctMoCargoRoute (0x27) / ctMoPatrol (0x28) extra fields**: after the waypoint list the spec lists
+  smelter/mine waypoint indices + unit ids (cargo route) and two unknown shorts (patrol). The decoder
+  shows the waypoints and dumps these as `tail:` - capture one to label them.
+- **ctGameOpt (0x2b) field 0** (the leading u16 the spec marks "unknown") and which variableIds appear
+  in normal play vs cheats.
+- `0x18` ctMoTransfer - selection header confirmed, trailing fields not in the spec doc; capture live.
 
-The decoder (`cmd_name` / `decode_cmd` in `src/net/op2client.cpp`) encodes the above; extend it as
-each command is pinned.
+Field layouts come from the engine's `DataStructure CommandPacket.txt` (authoritative) plus live
+capture. The decoder (`cmd_name` / `decode_cmd` in `src/net/op2client.cpp`) now renders every command
+above; extend it as the remaining enums/fields are pinned.
 
 ## Appendix: engine internals (from the executor `FUN_0040e300`)
 The executor is `FUN_0040e300(param_1, param_2, player, command)`:

@@ -17,17 +17,28 @@ Companion docs: `JOIN_PROTOCOL.md` (early spec), `START_CHECKSUM.md`
 |---|---|---|
 | 47776 (0xBAA0) | discovery (find games) | host, bound to its **specific IP** |
 | 47777 (0xBAA1) | **join handshake** | host, specific IP |
-| 47800-47807 (0xBAB8-F) | **game data / lobby / gameplay** | host binds 47800 (specific IP); client binds first free, **to the local IP** |
+| 47800-47807 (0xBAB8-F) | **game data / lobby / gameplay** | host binds 47800; client binds first free, **matching the host's style** (wildcard vs a 1.4.x/NetHelper host, specific-IP vs retail 1.3.6) |
 | ephemeral (ANY) | the host's *send* sockets (e.g. 60278) | `0.0.0.0` - they appear as the source of host→client packets and *can* receive |
 
 The host's game **receive** thread reads only its bound game socket (47800,
 `Network+0x14`). **All client→host game traffic must go to 47800**, even though the host
 *sends* from an ANY-bound ephemeral port.
 
-> **Same-machine gotcha:** bind the client game socket to the **resolved local IP**
-> (`gethostname`→`gethostbyname`), *not* `INADDR_ANY`. The host binds 47800 to its
-> specific IP; an `INADDR_ANY` bind lets the host's more-specific socket steal our
-> replies. Binding the local IP also makes the 47800-port scan correctly skip the host.
+> **Same-machine gotcha:** never let the client end up bound to the host's own game port
+> (47800), or replies to `hostIp:47800` get delivered to our own most-specific socket. **Bind the
+> client game socket the SAME WAY the host binds** - because on Windows a wildcard (`0.0.0.0`) bind
+> and a specific-IP bind to the same UDP port *co-exist* (most-specific wins delivery), so no single
+> mode is safe against both host types:
+> - **Host with NetHelper on** (binds wildcard) → bind **wildcard** (wildcard-vs-wildcard conflicts, so
+>   we skip 47800). A specific bind would co-exist with the host's wildcard and steal its traffic.
+> - **Host with NetHelper off** (vanilla, binds specific-IP) → bind **specific** to our local IP
+>   (specific-vs-specific conflicts). A wildcard bind would co-exist with the host's (and a 3rd player's)
+>   specific bind and lose/steal traffic ("host stopped responding" / "Connecting to session failed").
+>
+> The determinant is **NetHelper on/off** (not the game version), so the client **auto-detects** it: a
+> throwaway wildcard bind to the host's 47800 *fails* iff the host already holds it wildcard (NetHelper
+> on), succeeds otherwise. `--ver` is just the version gate. Also skip 47800 when the host is on this
+> machine. Full root-cause writeup: `OP2SessionLogger/NETPLAY.md`.
 
 ---
 
@@ -357,8 +368,38 @@ Command-type enum (executor `FUN_0040E300`): `0`=ctNop, `0x31`=ctQuit,
 `0x34`=ctMachineSettings, ... (full table in `FINDINGS.md`). A non-idle bot
 fills real blocks here (still with a non-zero `unk`).
 
+### Clean in-game leave - ctQuit, command block type `0x31`
+A player resigning/leaving emits a **ctQuit** block: `31 00 <unk(4, non-zero)>` with **no
+data** - the quitting player is identified by the turn's `playerNum` field (wire `0x13`). Pin
+it to a fresh never-committed mark like any injected block (see section 12). An external client
+can **self-originate** the turn (it does not need to answer an incoming host turn): build a
+cmd-0x0C at `maxSentMark + CPPI` carrying the ctQuit, with a synthetic non-zero `unk`, and stop
+mirroring host turns so the mark is not overtaken. Verified live: the host prints
+`<name> has quit the game` and removes the player immediately, instead of waiting out the
+~800 ms reliable-drop timeout and showing its "lost contact - Drop Player" dialog.
+
 In-game globals: CPPI `0x56EB08`, lgCPPI `0x56EB0C`, commandTurnDelay `0x56EB18`,
 tick `0x56EB1C`; per-player command ring base `DAT_0056F3E4` (stride `0xC24`, slot `0x71`).
+
+### Multi-peer (3+ players) - gameplay is peer-to-peer, turns are broadcast
+Gameplay traffic is **peer-to-peer**: each player sends their per-tick command turn directly to
+*every* other player (confirmed live - a third player's packets arrive from its own address, not
+relayed by the host), and a mark cannot commit until all players' turns are in. Command turns
+are **broadcast**: `dst = 0` and **GUR flags = `0x00`** (no channel, no seq validation - deduped
+by execution mark). This matters for an external client: the channel-A stream (`flags 0x0A`)
+that the host accepts is **rejected by a peer that never saw it** (channel A is a strict
+per-sender sequence, and all lobby channel-A traffic went only to the host). So to play in a 3+
+player game, send each command turn as a `dst=0`, `flags=0x00` broadcast to every peer's game
+address. Each peer's gate accepts `dest == theirNetID || 0`. In-game chat (block `0x30`) and a
+player leaving (`ctQuit 0x31`) each ride in **that player's own** command turn (the turn's
+`playerNum` at wire `0x13` = the sender's slot), so read them from every player's turn, not just
+the host's.
+
+Peer game addresses come from the **cmd-4 SetPlayerList roster** (see section 9). Roster payload
+at wire `0x12`: `numPlayers(u32)`, then 6 slots of
+`[IP(4, network order) | port(2, host order) | status(2) | netID(4, LE)]`. The port is the
+peer's **bound game port** (47800-47807, first-free per player) - not the ephemeral source port
+its packets arrive from. `netID & 7 == slot`.
 
 ## 11. Full client sequence (what op2session does, end to end)
 ```

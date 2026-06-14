@@ -37,8 +37,8 @@ op2::ClientState st = client.snapshot();   // immutable copy, taken under a mute
 ## What the GUI shows
 - Always: **Player Name** (read-only, fixed identity), **Our IP**, connection status.
 - Joining: **Scan LAN & Join**, or enter an **IP** and **Join IP**.
-- In the lobby: **Host IP**, **Game name**, **Map DLL**, **Our Color**, and a table of **all
-  players** (name / color / race / ready).
+- In the lobby: **Host IP**, **Game name**, **Map DLL**, **Host Ver** (the host's TApp::Version),
+  **Our Color**, and a table of **all players** (name / color / race / ready).
 - In game: **Game Duration**, **Game Tick**, **Game Mark** (= tick / 100, matches OP2's own
   "Current Mark"), and **command-packet counts** (sent / received).
 - A unified, timestamped **chat log** (`[hh:mm] name: text`) with a send box - lobby and
@@ -106,12 +106,32 @@ cmake --build build
 3. Click START on the host. The bot follows the handshake; in-game stats and chat start updating.
 4. Click **Disconnect** (or close the window) to leave cleanly.
 
-## Notes & Limitations
-- Verified against **retail 1.3.6** on a LAN; OPU 1.4.1 shares the wire format.
+### Command-line flags (optional, for headless / scripted runs)
+```
+OP2DummyPlayer.exe --scan              # scan the LAN and join the first hosted game
+OP2DummyPlayer.exe --ip 10.0.0.5       # join a specific host directly
+OP2DummyPlayer.exe --scan --ver 1.3.0.4  # advertise a specific TApp::Version
+OP2DummyPlayer.exe --debug             # self-test: join, post a "leaving" chat, leave cleanly, exit
+```
+**Host version must match.** An OP2 host ejects a peer whose advertised `TApp::Version` differs
+from its own, so pick it up front with `--ver`: the default **1.4.0.1** joins **OPU 1.4.1** hosts;
+pass `--ver 1.3.0.4` for **retail 1.3.6** hosts. The host's version shows in chat and the lobby
+panel ("Host Ver") once joined; on a mismatch the status reads *"Ejected: wrong game version. Host
+is X, we sent Y. Pass --ver X."* `--debug` is a clean headless self-test (join -> leaving chat ->
+clean `cmd-0x0B` quit -> exit).
+
+## Notes & limitations
+- Works against **both retail 1.3.6 and OPU 1.4.1** hosts (default advertises 1.4.0.1; use
+  `--ver 1.3.0.4` for 1.3.6 - see the flags above). Same-machine play needs the game-socket bind to
+  **match the host's style** - a host with **NetHelper on** binds wildcard `0.0.0.0`, a host with
+  **NetHelper off** (vanilla) binds specific-IP - because Windows lets a wildcard and a specific bind
+  co-exist on one port and the most-specific socket steals the traffic. The client **auto-detects** which
+  (a wildcard-bind probe of the host's port), so `--ver` is only the version gate. Full root-cause
+  writeup in `..\OP2SessionLogger\NETPLAY.md`.
 - **Multi-peer (3+ players) supported.** Gameplay is peer-to-peer, so the bot parses the cmd-4
   roster into a peer table and broadcasts its command turns (dst 0, flags 0x00) to every peer,
   and reads chat + leaves from every player's turn. Verified live in a 3-player match (ran past
-  3400 ticks, all players' chat shown, clean "X has left the game").
+  3400 ticks, all players' chat shown, clean "X has left the game"). See `..\FINDINGS.md` #17.
 - Firewall: allow the app (or inbound UDP on 47776-47807), same as Outpost 2 itself.
 - The bot is an **idle (passive) player**: it keeps the lockstep alive with empty command
   turns and chats, but issues no gameplay commands. The file checksum is skipped (it is a
@@ -121,5 +141,6 @@ cmake --build build
   passive client can't tell those apart from an eject on the wire.
 - `winbuild.bat` hard-codes a VS install path; adjust it for your machine, or use the generic
   CMake commands above.
-- Protocol reference: `..\PROTOCOL.md` (byte-exact)
+- Protocol reference: `..\PROTOCOL.md` (byte-exact) and `..\FINDINGS.md`
+  (the reverse-engineering journey, including the in-game chat fresh-mark gotcha).
 - Parked future ideas (in-game actions, hosting games) are noted in `IDEAS.md`.

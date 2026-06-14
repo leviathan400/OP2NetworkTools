@@ -20,6 +20,13 @@ static uint64_t now_ms() {
     return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+// Format a TApp::Version dword (e.g. 0x01040001 -> "1.4.0.1").
+static std::string ver_str(uint32_t v) {
+    char b[24];
+    snprintf(b, sizeof(b), "%u.%u.%u.%u", (v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff);
+    return b;
+}
+
 // ---- debug log -------------------------------------------------------------
 // Directory containing the running executable (with trailing separator), so the log lands
 // next to the exe regardless of the working directory.
@@ -124,6 +131,11 @@ void Client::setPlayerName(const std::string& name) {
     if (!name.empty()) playerName_ = name.substr(0, 12);
 }
 
+void Client::setTappVersion(uint32_t v) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (v) tappVersion_ = v;
+}
+
 bool Client::connectScan() {
     if (running_.exchange(true)) return false;
     if (worker_.joinable()) worker_.join();   // reap a previous self-exited worker (host ended)
@@ -212,7 +224,11 @@ void Client::setDisconnected(const std::string& reason) {
 // ===========================================================================
 void Client::run(bool scan, std::string targetIp) {
     std::string myName;
-    { std::lock_guard<std::mutex> lk(mtx_); myName = playerName_; }
+    uint32_t    myVer;
+    { std::lock_guard<std::mutex> lk(mtx_); myName = playerName_; myVer = tappVersion_; }
+    { char vb[16]; snprintf(vb, sizeof(vb), "%u.%u.%u.%u",
+        (myVer>>24)&0xff, (myVer>>16)&0xff, (myVer>>8)&0xff, myVer&0xff);
+      debug_log(std::string("advertising TApp version ") + vb); }
 
     if (!net_startup()) { setDisconnected("socket init failed"); running_ = false; return; }
 
@@ -273,13 +289,48 @@ void Client::run(bool scan, std::string targetIp) {
     op2_sock_t gs = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (gs == OP2_INVALID_SOCK) { setDisconnected("socket() failed"); net_cleanup(); running_ = false; return; }
     set_rcv_timeout(gs, 200);
+    // Bind our game socket to the first free port in 47800-47807, MATCHING THE HOST'S BIND STYLE so
+    // ports conflict cleanly instead of co-existing (on Windows a wildcard bind and a specific-IP bind
+    // to the same UDP port co-exist, and the most-specific socket silently STEALS the traffic):
+    //   - Host with NetHelper ON binds WILDCARD (0.0.0.0). We bind WILDCARD too: wildcard-vs-wildcard
+    //     conflicts, so we skip the host's/peers' occupied ports. (A specific bind would co-exist with
+    //     the host's wildcard 47800 and steal its traffic - the original 1.4.1 lobby-drop bug.)
+    //   - Host with NetHelper OFF (vanilla) binds SPECIFIC-IP. We bind SPECIFIC to our local IP:
+    //     specific-vs-specific conflicts cleanly, so we skip 47800 and a later real client skips us.
+    //     (A wildcard bind here co-exists with the host's - and a 3rd player's - specific bind and
+    //     loses/steals traffic: "host stopped responding" / "Connecting to session failed".)
+    // The determinant is NetHelper ON/OFF, NOT the game version, so we DETECT the host's style by probe:
+    // try a throwaway WILDCARD bind to the host's game port (47800) - it FAILS if the host already holds
+    // 47800 wildcard (NetHelper ON), SUCCEEDS if specific-bound (co-exists) or free (NetHelper OFF).
+    // `--ver` is independent (game VERSION we advertise, not the bind mode). When the host is on THIS
+    // machine we also skip 47800. Full root-cause writeup in ..\OP2SessionLogger\NETPLAY.md.
+    bool nethelper;
+    {
+        op2_sock_t probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        nethelper = false;
+        if (probe != OP2_INVALID_SOCK) {
+            sockaddr_in pa{}; pa.sin_family = AF_INET; pa.sin_addr.s_addr = INADDR_ANY; pa.sin_port = htons((uint16_t)GAME_PORT_LO);
+            nethelper = (bind(probe, (sockaddr*)&pa, sizeof(pa)) != 0);   // fails => host holds 47800 wildcard => NetHelper ON
+            close_sock(probe);
+        }
+    }
+    bool sameMachine = (localIp != 0 && localIp == hostIp);
+    uint32_t bindAddr = nethelper ? INADDR_ANY : (localIp ? localIp : INADDR_ANY);
+    int loPort = sameMachine ? GAME_PORT_LO + 1 : GAME_PORT_LO;
     uint16_t ourPort = 0;
-    for (int p = GAME_PORT_LO; p <= GAME_PORT_HI; p++) {
+    for (int p = loPort; p <= GAME_PORT_HI; p++) {
         sockaddr_in la{}; la.sin_family = AF_INET;
-        la.sin_addr.s_addr = localIp ? localIp : INADDR_ANY; la.sin_port = htons((uint16_t)p);
+        la.sin_addr.s_addr = bindAddr; la.sin_port = htons((uint16_t)p);
         if (bind(gs, (sockaddr*)&la, sizeof(la)) == 0) { ourPort = (uint16_t)p; break; }
     }
     if (!ourPort) { setDisconnected("could not bind game port 47800-47807"); close_sock(gs); net_cleanup(); running_ = false; return; }
+    {
+        unsigned char* ib = (unsigned char*)&bindAddr; char ab[24];
+        snprintf(ab, sizeof(ab), "%u.%u.%u.%u", ib[0], ib[1], ib[2], ib[3]);
+        debug_log("bound game socket to " + std::string(ab) + ":" + std::to_string((unsigned)ourPort)
+                  + (nethelper ? " [detected NetHelper ON - wildcard]" : " [detected NetHelper OFF - specific]")
+                  + (sameMachine ? " (same-machine - skipped host 47800)" : ""));
+    }
 
     // ---- 3) join handshake ----
     setPhase(Phase::Joining, "Sending join request...");
@@ -349,7 +400,7 @@ void Client::run(bool scan, std::string targetIp) {
         wr32(p+0x00, assignedNetID); wr32(p+0x04, hostNetID);
         p[0x08]=(uint8_t)payloadSize; p[0x09]=0;
         p[0x0E]=0x0A; p[0x0F]=ourSeqA; p[0x10]=ackA; p[0x11]=ackB;
-        p[0x12]=3; wr32(p+0x13, TAPP_VERSION);
+        p[0x12]=3; wr32(p+0x13, myVer);
         memcpy(p+0x17, myName.data(), nameLen);
         wr32(p+0x0A, wire_cksum(p));
         sendto(gs,(char*)p,total,0,(sockaddr*)&dst,sizeof(dst));
@@ -433,6 +484,10 @@ void Client::run(bool scan, std::string targetIp) {
     // ---- lobby/game state machine ----
     bool lobbyJoined=false, gameStarting=false, gameLive=false;
     bool loadedSent=false;
+    bool hostVerShown=false;      // post the host's TApp version to chat once
+    uint32_t hostTappVer=0;       // host's TApp::Version from the GSI
+    bool verMismatch=false;       // our advertised version != the host's (the host will eject us)
+    uint64_t lastHostRecv=now_ms();   // last packet whose source IS the host (for the lobby-silence drop)
     LobbyInfo prevLobby;
     // in-game tick + chat tracking (see FINDINGS.md #13-15)
     bool haveFirstExec=false, haveLastExec=false;
@@ -449,9 +504,51 @@ void Client::run(bool scan, std::string targetIp) {
     bool quitInGameSent=false; uint64_t quitDoneMs=0;
     bool playerLeft[6] = {false,false,false,false,false,false};   // announced "<name> has left" once per slot
     std::string lastChatBySlot[6];                                // de-dup in-game chat per sender slot
+    // In-game lockstep "clock": the player whose command turns we mirror (reply to at the same exec
+    // mark). It starts as the host, but the host leaving does NOT end the game - gameplay is P2P, so
+    // we FAIL OVER to a surviving peer and keep exchanging turns. (Without this, the moment the host
+    // leaves we stop producing turns, and the remaining player's engine drops us ~13 s later with
+    // "We have lost contact with player X".) Re-elect on the clock's ctQuit, or on a clock-silence
+    // timeout while another peer is still sending turns.
+    uint32_t clockNetID = hostNetID; int clockSlot = (int)(hostNetID & 7);
+    uint64_t lastTurnMsBySlot[6] = {0,0,0,0,0,0};                 // last cmd-0x0C seen from each slot
+    uint64_t lastCmdTurnMs=0;                                     // last turn from the clock (game-end / failover timing)
+    // Map a lobby slot (0-5) back to its full netID: the host owns slot (hostNetID & 7); every other
+    // slot is looked up in the cmd-4 peer roster. Returns 0 if no player occupies that slot.
+    auto netIDForSlot = [&](int s) -> uint32_t {
+        if (s == (int)(hostNetID & 7)) return hostNetID;
+        for (int i = 0; i < peerCount; i++) if ((int)(peers[i].netID & 7) == s) return peers[i].netID;
+        return 0;
+    };
+    // Re-elect the lockstep clock to the lowest-slot player that is NOT us, has not left, and is
+    // still sending command turns (a turn within the last 3.5 s). Returns false when no such player
+    // remains (we are the last one standing -> the game is genuinely over). Resets the turn-silence
+    // timer so the game-end watchdog doesn't trip during the hand-off.
+    auto electClock = [&]() -> bool {
+        int best = -1;
+        for (int s = 0; s < 6; s++) {
+            if (s == (int)ourPlayerNum || s == clockSlot || playerLeft[s]) continue;   // only fail over to a DIFFERENT live player
+            if (lastTurnMsBySlot[s] == 0 || now_ms() - lastTurnMsBySlot[s] > 3500) continue;
+            if (netIDForSlot(s) == 0) continue;
+            best = s; break;
+        }
+        if (best < 0) return false;   // no other player still sending turns - we are the last one
+        uint32_t nid = netIDForSlot(best);
+        if (nid != clockNetID) {
+            clockNetID = nid; clockSlot = best;
+            std::string nm;
+            { std::lock_guard<std::mutex> lk(mtx_);
+              if (state_.lobby.slot[best].occupied) nm = state_.lobby.slot[best].name; }
+            if (nm.empty()) nm = "Player " + std::to_string(best);
+            addChat("", std::string("*** host left - continuing P2P, now syncing to ") + nm + " ***", false);
+            debug_log("clock failover -> slot " + std::to_string(best) + " (" + nm + ") netID=" + std::to_string(nid));
+        }
+        lastCmdTurnMs = now_ms();
+        return true;
+    };
     long cmd0cSent=0, cmd0cRecv=0;
     bool glhfSent=false, quitSent=false;  // auto-greeting / lobby-quit one-shots
-    uint64_t lastKeep=0, lastRecv=now_ms(), lastCmdTurnMs=0, leaveStartMs=0;
+    uint64_t lastKeep=0, lastRecv=now_ms(), leaveStartMs=0;
     uint8_t leaveBuf[200]; int leaveBufLen=0, leaveExec=0;   // pre-built goodbye+ctQuit leave turn
 
     while (!stop_) {
@@ -459,6 +556,7 @@ void Client::run(bool scan, std::string targetIp) {
         int n = recvfrom(gs, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
         if (n > 0) {
             lastRecv = now_ms();
+            if (n >= 4 && rd32(buf+0x00)==hostNetID) lastHostRecv = now_ms();
             // GUR ack/seq tracking from host type-0 packets
             if (n >= 0x12 && buf[0x09] == 0) {
                 uint8_t flags = buf[0x0E], seq = buf[0x0F];
@@ -471,11 +569,44 @@ void Client::run(bool scan, std::string targetIp) {
             if (buf[0x09]==0 && buf[0x08]==0xBF && n>=0xCD && buf[0x12]==1) {
                 LobbyInfo cur = parse_gsi(buf, n);
                 if (cur.valid) {
-                    std::lock_guard<std::mutex> lk(mtx_);
-                    state_.lobby = cur;
-                    int s = (int)(assignedNetID & 7);
-                    if (s >= 0 && s < 6) { state_.ourColor = cur.slot[s].color; state_.ourReady = cur.slot[s].ready; }
-                    prevLobby = cur;
+                    // Lobby departures (left or ejected): a player whose netId was in the previous
+                    // roster but is gone from this one has left the lobby. The host removes them from
+                    // its broadcast roster (the engine's cmd-0x05 "removed" notice is unicast only to
+                    // the player itself, so we never see another player's). Match by netId across all
+                    // slots so a slot-move doesn't false-fire. We can't tell a voluntary leave from an
+                    // eject on the wire, so the line is neutral.
+                    if (prevLobby.valid && !gameLive) {
+                        for (int i = 0; i < 6; i++) {
+                            uint32_t was = prevLobby.slot[i].occupied ? prevLobby.slot[i].netId : 0;
+                            if (was == 0 || was == assignedNetID) continue;
+                            bool stillHere = false;
+                            for (int j = 0; j < 6; j++) if (cur.slot[j].occupied && cur.slot[j].netId == was) { stillHere = true; break; }
+                            if (!stillHere) {
+                                std::string nm = prevLobby.slot[i].name;
+                                addChat("", "*** " + (nm.empty() ? ("Player " + std::to_string(i)) : nm) + " left the lobby ***", false);
+                            }
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        state_.lobby = cur;
+                        int s = (int)(assignedNetID & 7);
+                        if (s >= 0 && s < 6) { state_.ourColor = cur.slot[s].color; state_.ourReady = cur.slot[s].ready; }
+                        prevLobby = cur;
+                    }
+                    // Host game version (TApp::Version, from the GSI blob): show it once, and warn if
+                    // our advertised version doesn't match - the host will eject a mismatched client.
+                    if (!hostVerShown && cur.tappVersion) {
+                        hostVerShown = true;
+                        hostTappVer = cur.tappVersion;
+                        verMismatch = (myVer != 0 && myVer != cur.tappVersion);
+                        char hex[16]; snprintf(hex, sizeof(hex), "0x%08X", cur.tappVersion);
+                        debug_log(std::string("host TApp version ") + ver_str(cur.tappVersion) + " (" + hex + ")"
+                                  + (verMismatch ? " - MISMATCH (we sent " + ver_str(myVer) + ")" : ""));
+                        addChat("", "Host game version: " + ver_str(cur.tappVersion) + " (" + hex + ")", false);
+                        if (verMismatch)
+                            addChat("", "*** VERSION MISMATCH: we sent " + ver_str(myVer) + " - host will eject us ***", false);
+                    }
                 }
             }
             // Incoming LOBBY chat (engine cmd 6, type 0, channel-A, relayed by the host).
@@ -514,6 +645,13 @@ void Client::run(bool scan, std::string targetIp) {
                             memset(&pe.addr, 0, sizeof(pe.addr));
                             pe.addr.sin_family = AF_INET;
                             memcpy(&pe.addr.sin_addr, e, 4);          // IP is already network order
+                            // The host lists ITSELF in the roster with its bind address - and an OPU
+                            // 1.4.1 host (NetHelper) binds INADDR_ANY, so its own entry's IP is 0.0.0.0.
+                            // Broadcasting our in-game command turns to 0.0.0.0 goes nowhere, so the
+                            // host never gets our input and the lockstep stalls at the first command-turn
+                            // boundary (~tick 8). Substitute the host's real IP (known from discovery)
+                            // for any 0.0.0.0 roster entry. (Other peers carry a real IP via NatFix.)
+                            if (pe.addr.sin_addr.s_addr == 0) pe.addr.sin_addr.s_addr = hostIp;
                             pe.addr.sin_port = htons(rd16(e + 4));    // port is stored host order
                             newCount++;
                         }
@@ -541,10 +679,22 @@ void Client::run(bool scan, std::string targetIp) {
                 uint8_t ec = buf[0x12];
                 if (ec == 0x0B) {
                     send_gur_ack(gameAddr);
-                    // cmd-0x0B targeted at us = eject; broadcast (dst 0) = host closed the lobby.
+                    // cmd-0x0B targeted at us = eject; broadcast (dst 0) = host left/closed.
                     uint32_t dst = rd32(buf+0x04);
-                    setDisconnected(dst == assignedNetID ? "Ejected from the lobby by the host." : "Host ended the lobby.");
-                    break;
+                    if (dst == assignedNetID) {
+                        setDisconnected(gameLive ? "Removed from the game by the host." : "Ejected from the lobby by the host.");
+                        break;
+                    }
+                    if (gameLive) {
+                        // Host left an IN-PROGRESS game: P2P continues. Mark the host gone and fail
+                        // over to a surviving peer rather than ending the match.
+                        int hs = (int)(hostNetID & 7);
+                        if (!playerLeft[hs]) { playerLeft[hs] = true; addChat("", "*** the host has left the game ***", false); }
+                        if (hs == clockSlot && !electClock()) { setDisconnected("Game over - all other players have left."); break; }
+                    } else {
+                        setDisconnected("Host ended the lobby.");
+                        break;
+                    }
                 }
                 if (ec == 10)   { send_gur_ack(gameAddr); setDisconnected("Host canceled the game start."); break; }
                 if ((ec==7 || ec==8) && !gameStarting) { gameStarting = true; setPhase(Phase::Starting, "Host is starting the game..."); }
@@ -570,7 +720,7 @@ void Client::run(bool scan, std::string targetIp) {
             // Skip entirely once leaving: the leave handler self-sends our final turn (goodbye +
             // ctQuit) at a pinned mark, so we must stop mirroring or maxSentMark would advance past
             // it and the host would reject the quit.
-            if (!leaving_ && buf[0x09]==0 && n>=0x18 && buf[0x12]==0x0C && rd32(buf+0x00)==hostNetID) {
+            if (!leaving_ && buf[0x09]==0 && n>=0x18 && buf[0x12]==0x0C && rd32(buf+0x00)==clockNetID) {
                 if (!gameLive) { gameLive = true; gameStartMs = now_ms(); { std::lock_guard<std::mutex> lk(mtx_); state_.gameStarted = true; } setPhase(Phase::InGame, "Game started."); addChat("", "*** GAME STARTED ***", false); }
                 cmd0cRecv++;
                 int execTick = (int)rd32(buf+0x14);
@@ -604,8 +754,12 @@ void Client::run(bool scan, std::string targetIp) {
                     if (off + 6 + (int)blen > n) break;
                     uint32_t unk = rd32(buf+off+2);
                     int blockMark = execTick + idx*cppi;
-                    // incoming host chat block (type 0x30): data = [sender, mask, text NUL]
-                    if (buf[off]==0x30 && blen>=3) {
+                    // incoming host chat block (type 0x30): data = [sender, mask, text NUL]. Only show
+                    // it here while the CLOCK IS THE HOST. After a host-leave failover the clock is a
+                    // peer, whose chat is already surfaced (with the correct name) by the read-only
+                    // peer-turn handler below - showing it here too would duplicate it AND mislabel it
+                    // with the game name (e.g. "DevHost: ..." for a message Leviathan actually sent).
+                    if (buf[off]==0x30 && blen>=3 && clockNetID == hostNetID) {
                         const char* txt = (const char*)(buf + off + 6 + 2);
                         if (lastRecvChat != txt) { lastRecvChat = txt; std::string gn; { std::lock_guard<std::mutex> lk(mtx_); gn = state_.gameName; } addChat(gn.empty()?"host":gn, txt, false); }
                     }
@@ -665,6 +819,7 @@ void Client::run(bool scan, std::string targetIp) {
                 uint32_t lsrc = rd32(buf+0x00);
                 int lslot = buf[0x13];
                 if (lsrc != assignedNetID && lslot >= 0 && lslot < 6 && lslot != (int)ourPlayerNum) {
+                    lastTurnMsBySlot[lslot] = now_ms();   // liveness per slot (for clock failover)
                     std::string nm;
                     { std::lock_guard<std::mutex> lk(mtx_);
                       if (state_.lobby.slot[lslot].occupied && !state_.lobby.slot[lslot].name.empty())
@@ -681,6 +836,11 @@ void Client::run(bool scan, std::string targetIp) {
                             playerLeft[lslot] = true;
                             addChat("", std::string("*** ") + nm + " has left the game ***", false);
                             debug_log("peer left: slot " + std::to_string(lslot) + " (" + nm + ") sent ctQuit (0x31)");
+                            // If the player who left was our lockstep clock (e.g. the host), the game
+                            // is NOT over - gameplay is P2P. Fail over to a surviving peer and keep
+                            // exchanging turns so the remaining players don't lose contact with us.
+                            if (lslot == clockSlot && !electClock())
+                                debug_log("clock left and no survivors - game will end");
                         }
                         o += 6 + bl;
                     }
@@ -750,11 +910,33 @@ void Client::run(bool scan, std::string targetIp) {
         }
         // refresh duration even when no in-game packet arrived this tick
         if (gameLive) { std::lock_guard<std::mutex> lk(mtx_); state_.gameDurationSec = (now_ms()-gameStartMs)/1000.0; }
-        // GAME ENDED: once command turns have been flowing, the host streams them continuously
-        // (~30/s). A multi-second gap means the host ended/left the match. (Set only after the
-        // first turn, so it never trips during the host's pre-game load pause.)
+        // CLOCK FAILOVER (no clean ctQuit): if our lockstep clock goes quiet mid-game but another
+        // peer is still streaming turns, the clock crashed/closed without a ctQuit. Don't end the
+        // game - fail over to the live peer and keep playing. electClock() only switches to a peer
+        // with a recent turn, so when nobody is left it returns false and the watchdog below ends it.
+        if (!leaving_ && gameLive && lastCmdTurnMs && now_ms() - lastCmdTurnMs > 3000)
+            electClock();
+        // GAME ENDED: in-game, players stream command turns continuously (~30/s). A multi-second gap
+        // with NO surviving clock means every other player has left (or the match is over). The host
+        // leaving alone does NOT end the game - we fail over above and keep playing P2P; this only
+        // trips when no other player remains. (Set only after the first turn, so it never fires
+        // during the host's pre-game load pause.)
         if (!leaving_ && lastCmdTurnMs && now_ms() - lastCmdTurnMs > 6000) {
-            setDisconnected("Game ended (host left or the match is over).");
+            setDisconnected("Game over - all other players have left.");
+            break;
+        }
+        // Lobby eviction via host-SPECIFIC silence. When the host rejects/removes us (most often a
+        // version mismatch - it then prints "had wrong game version and was ejected"), it stops
+        // sending TOWARD us but its LAN broadcasts keep `lastRecv` fresh - so the plain recv timeout
+        // below never fires. Watch the gap since the last packet whose source IS the host instead
+        // (normal host unicast cadence is < 1 s, so a 4 s gap is unambiguous). If we already know our
+        // advertised version != the host's, say so specifically - that's the actionable case.
+        if (lobbyJoined && !gameStarting && !gameLive && now_ms() - lastHostRecv > 4000) {
+            if (verMismatch)
+                setDisconnected("Ejected: wrong game version. Host is " + ver_str(hostTappVer)
+                                + ", we sent " + ver_str(myVer) + ". Pass --ver " + ver_str(hostTappVer) + ".");
+            else
+                setDisconnected("Host stopped responding to us.");
             break;
         }
         // host-silence disconnect (longer grace once starting/live: host pauses to load).

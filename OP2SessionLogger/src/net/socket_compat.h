@@ -69,4 +69,18 @@ inline void set_broadcast(op2_sock_t s, bool on) {
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char*)&yes, sizeof(yes));
 }
 
+// Take EXCLUSIVE ownership of the bound address/port (call before bind). On Windows this stops a
+// later socket - including a wildcard (INADDR_ANY) bind by another local OP2 instance - from
+// coexisting on our port and stealing our traffic (the specific+wildcard quirk), and makes OUR own
+// bind fail cleanly on any port the host/a peer already holds. POSIX binds are exclusive by default
+// (we just never set SO_REUSEADDR), so this is a Windows-only no-op elsewhere.
+inline void set_exclusive_addr(op2_sock_t s) {
+#ifdef _WIN32
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&yes, sizeof(yes));
+#else
+    (void)s;
+#endif
+}
+
 } // namespace op2

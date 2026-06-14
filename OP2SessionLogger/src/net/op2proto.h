@@ -16,7 +16,11 @@ static const int      DISCOVERY_PORT  = 47776;       // 0xBAA0
 static const int      JOIN_PORT       = 47777;       // 0xBAA1
 static const int      GAME_PORT_LO    = 47800;       // 0xBAB8
 static const int      GAME_PORT_HI    = 47807;       // 0xBABF
-static const uint32_t TAPP_VERSION    = 0x01030004;  // TApp::Version "1.3.0.4"
+static const uint32_t TAPP_VERSION    = 0x01040001;  // default TApp::Version "1.4.0.1" (OPU 1.4.1).
+                                                     // Override at runtime with --ver (e.g. 1.3.0.4
+                                                     // for retail 1.3.6) - the host drops a peer whose
+                                                     // advertised version != its own, and we must send
+                                                     // ours (in cmd-3) before the GSI reveals theirs.
 
 // OP2 game-type GUID (constant), raw 16 bytes (used to validate discovery replies).
 extern const uint8_t GAME_GUID[16];
@@ -48,6 +52,7 @@ struct PlayerSlot {
 
 struct LobbyInfo {
     bool        valid = false;
+    uint32_t    tappVersion = 0; // host's TApp::Version from the GSI blob (b+0x04), e.g. 0x01030004
     std::string mapDll;
     int         maxPlayers = 0;
     int         initVehicles = 0;

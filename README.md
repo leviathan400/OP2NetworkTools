@@ -43,6 +43,8 @@ set. -> [`OP2SessionLogger/README.md`](OP2SessionLogger/README.md)
 - [`DISCOVERY_PROTOCOL.md`](DISCOVERY_PROTOCOL.md) - the UDP discovery query/reply wire spec.
 - [`JOIN_PROTOCOL.md`](JOIN_PROTOCOL.md) - early over-arching join + command-turn spec.
 - [`START_CHECKSUM.md`](START_CHECKSUM.md) - the game-start file checksum (why we can skip it).
+- [`OP2SessionLogger/NETPLAY.md`](OP2SessionLogger/NETPLAY.md) - lobby/transport deep-dive +
+  the OPU **1.4.1** compatibility fix (host-version gate, same-machine bind collision).
 
 Each project folder has its own README with build + usage details.
 
@@ -52,3 +54,12 @@ lobby and in-game chat, a stable lockstep match with the external client as a pl
 in-game leave (ctQuit, so the host removes the bot without a drop-timeout), and **multi-peer
 (3+ player) games** - the bot broadcasts its command turns to every peer and shows all players'
 chat. A 3-player match ran past 3400 ticks with the bot as a full player.
+
+Works against **both retail 1.3.6 and OPU 1.4.1** hosts. The clients advertise `TApp::Version`
+**1.4.0.1** by default (pass `--ver 1.3.0.4` for a 1.3.6 host) - the host ejects a version mismatch.
+Same-machine play needs the game-socket bind to **match the host's style** - a host with **NetHelper on**
+binds wildcard `0.0.0.0`, a host with **NetHelper off** (vanilla) binds specific-IP - or Windows lets the
+two co-exist on one port and the most-specific socket steals the traffic. The clients **auto-detect**
+which (a wildcard-bind probe of the host's port), so `--ver` is only the version gate, not the bind mode.
+In game it's confirmed **peer-to-peer** (and the bot keeps playing if the host leaves). See
+[`OP2SessionLogger/NETPLAY.md`](OP2SessionLogger/NETPLAY.md).

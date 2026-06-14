@@ -37,6 +37,7 @@ LobbyInfo parse_gsi(const uint8_t* p, int n) {
     if (n < 0x13 + 0xBA) return s;          // need the full 191-byte blob
     const uint8_t* b = p + 0x13;            // blob base = wire 0x13 (after 5-byte GUR sub-header)
     uint32_t flags = rd32(b + 0x00);
+    s.tappVersion  = rd32(b + 0x04);        // host TApp::Version (e.g. 0x01030004 = "1.3.0.4")
     s.maxPlayers   = (flags >> 6) & 7;
     s.initVehicles = (flags >> 17) & 0xf;
     s.gameSpeed    = rd16(b + 0xAE) >> 2;

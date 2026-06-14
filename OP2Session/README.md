@@ -37,10 +37,15 @@ counters, `cmd0c=` turn count).
 
 ## Build & run
 ```
-build.bat                 (MSVC: cl /O2 op2session.cpp ws2_32.lib  -> op2session.exe)
-op2session.exe            (auto-discovers the host)
-op2session.exe 10.0.61.18 (target a host by IP)
+build.bat                       (MSVC: cl /O2 op2session.cpp ws2_32.lib  -> op2session.exe)
+op2session.exe                  (auto-discovers the host)
+op2session.exe 10.0.61.18       (target a host by IP)
+op2session.exe --ver 1.3.0.4    (advertise a specific TApp::Version)
 ```
+**Host version must match.** An OP2 host ejects a peer whose advertised `TApp::Version` differs
+from its own. The default **1.4.0.1** joins **OPU 1.4.1** hosts; pass `--ver 1.3.0.4` for **retail
+1.3.6**. The host's version is printed once joined (with a `*** MISMATCH ***` warning if it differs
+from ours). `--ver` and the host-IP argument can be combined in any order.
 - .NET not involved; a single self-contained exe (Winsock only).
 - **Logging:** `op2session.ini` (next to the exe) controls the per-packet dumps:
   `[log] verbose=0` = clean milestone-only output (good for screenshots), `verbose=1` = full
@@ -91,7 +96,12 @@ protocol), **`..\FINDINGS.md`** (the RE journey + gotchas), plus `..\JOIN_PROTOC
 - **Tidy build**: gate the diagnostic dump behind a `-v` flag for a reference-quality client.
 
 ## Caveats
-- Built and verified against ** 1.3.6** on a LAN. OPU 1.4.1 shares the wire format.
+- Works against **both retail 1.3.6 and OPU 1.4.1** hosts (default advertises 1.4.0.1; use
+  `--ver 1.3.0.4` for 1.3.6). Same-machine play needs the game-socket bind to **match the host's
+  style** - a host with **NetHelper on** binds wildcard `0.0.0.0`, a host with **NetHelper off** (vanilla)
+  binds specific-IP - because Windows lets a wildcard and a specific bind co-exist on one port and the
+  most-specific socket steals the traffic. The tool **auto-detects** which (a wildcard-bind probe of the
+  host's port), so `--ver` is only the version gate. Full writeup in `..\OP2SessionLogger\NETPLAY.md`.
 - Firewall: allow `op2session.exe` (or inbound UDP) - same as OP2 itself.
 - This is an experimental protocol client, not a polished tool; expect verbose output and
   hard-coded constants. It is an idle (passive) player - it keeps the game alive but issues

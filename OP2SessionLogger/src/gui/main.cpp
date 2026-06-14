@@ -16,6 +16,23 @@
 
 static void glfw_error(int e, const char* d) { fprintf(stderr, "GLFW error %d: %s\n", e, d); }
 
+// Parse a duration like "5m", "30s", "2m30s", or a bare number of seconds. Returns seconds (0 = invalid).
+static double parse_duration(const char* s) {
+    if (!s || !*s) return 0.0;
+    double total = 0.0; bool any = false; const char* p = s;
+    while (*p) {
+        char* end = nullptr;
+        double v = strtod(p, &end);
+        if (end == p) return 0.0;                                    // not a number where one was expected
+        any = true;
+        if (*end == 'm' || *end == 'M') { total += v * 60.0; p = end + 1; }
+        else if (*end == 's' || *end == 'S') { total += v; p = end + 1; }
+        else if (*end == 0) { total += v; p = end; }                 // bare trailing number = seconds
+        else return 0.0;                                             // junk suffix
+    }
+    return any ? total : 0.0;
+}
+
 // ImGui color for a given OP2 player color index (Blue,Red,Green,Yellow,Cyan,Magenta).
 static ImVec4 op2_color(int c) {
     switch (c) {
@@ -29,8 +46,47 @@ static ImVec4 op2_color(int c) {
     return ImVec4(0.7f,0.7f,0.7f,1);
 }
 
-int main(int, char**) {
+int main(int argc, char** argv) {
     op2::debug_log("=== OP2SessionLogger started ===");
+
+    // Optional startup flags (so the app can be driven headlessly without clicking the GUI -
+    // useful for the capture/test loop):
+    //   --scan / --autojoin   scan the LAN and join the first hosted game
+    //   --ip <addr>           join a specific host IP directly
+    //   --ver a.b.c.d         advertise this TApp::Version (default 1.4.0.1 for OPU 1.4.1; pass
+    //                         1.3.0.4 for retail 1.3.6). The host drops a peer whose version != its own.
+    //   --debug               self-test run: scan+join, post a "leaving" chat, leave cleanly, then
+    //                         close the app. Lets the tool be run headlessly to capture a clean log.
+    //   --debug <dur>         TIMED run: scan+join, show a countdown on the form, and after the
+    //                         period (e.g. "5m", "90s", "2m30s", or bare seconds) leave cleanly and
+    //                         exit. Good for capturing a fixed-length live session unattended.
+    bool autoScan = false, debugRun = false, timedRun = false;
+    double runSeconds = 0.0;
+    std::string autoIp;
+    uint32_t tappVer = 0;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--scan" || a == "--autojoin") autoScan = true;
+        else if (a == "--debug" || a == "-debug") {
+            // Optional duration arg -> TIMED run; no duration -> the original chat self-test.
+            if (i + 1 < argc) {
+                double d = parse_duration(argv[i + 1]);
+                if (d > 0.0) { timedRun = true; runSeconds = d; autoScan = true; ++i; }
+                else { debugRun = true; autoScan = true; }
+            } else { debugRun = true; autoScan = true; }
+        }
+        else if ((a == "--debug-time" || a == "-debug-time") && i + 1 < argc) {
+            double d = parse_duration(argv[++i]);
+            if (d > 0.0) { timedRun = true; runSeconds = d; autoScan = true; }
+        }
+        else if ((a == "--ip" || a == "--join") && i + 1 < argc) autoIp = argv[++i];
+        else if (a == "--ver" && i + 1 < argc) {
+            unsigned va=0,vb=0,vc=0,vd=0;
+            if (sscanf(argv[++i], "%u.%u.%u.%u", &va,&vb,&vc,&vd) == 4)
+                tappVer = ((va&0xff)<<24)|((vb&0xff)<<16)|((vc&0xff)<<8)|(vd&0xff);
+        }
+    }
+
     glfwSetErrorCallback(glfw_error);
     if (!glfwInit()) { op2::debug_log("FATAL: glfwInit failed"); fprintf(stderr, "glfwInit failed\n"); return 1; }
 #if defined(__APPLE__)
@@ -54,12 +110,27 @@ int main(int, char**) {
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     op2::Client client;
+    if (tappVer) client.setTappVersion(tappVer);   // apply --ver before any connect
+
+    // Fire the requested auto-connect once, before the UI loop (the GUI still works normally after).
+    if (!autoIp.empty()) { op2::debug_log("auto-connect (cmdline): join " + autoIp); client.connectIp(autoIp); }
+    else if (autoScan)   { op2::debug_log("auto-connect (cmdline): scan LAN"); client.connectScan(); }
 
     // UI-owned input buffers
     static char nameBuf[16] = "OPU";
     static char ipBuf[64]   = "";
     static char chatBuf[128] = "";
     bool nameApplied = false;
+
+    // --debug self-test run (a tiny per-frame state machine driven below):
+    //   DBG_WAIT    -> waiting to reach the lobby (or to fail). On lobby: post a chat, go DBG_SENT.
+    //   DBG_SENT    -> +2 s (let the chat reliably send), then disconnect cleanly, go DBG_LEAVING.
+    //   DBG_LEAVING -> +0.3 s, then ask the window to close -> normal shutdown, go DBG_DONE.
+    // dbgMark holds the glfwGetTime() timestamp the current step started, for the delays above.
+    enum { DBG_WAIT, DBG_SENT, DBG_LEAVING, DBG_DONE } dbgState = DBG_WAIT;
+    double dbgMark = 0.0;
+    bool timedLeaving = false;        // --debug <dur>: one-shot guard for the timed clean-exit
+    if (timedRun) op2::debug_log("[timed] auto-exit after " + std::to_string((int)runSeconds) + " s");
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -69,6 +140,36 @@ int main(int, char**) {
 
         op2::ClientState st = client.snapshot();
         bool busy = client.running();
+
+        // --debug: drive the whole run, then close the window for a clean exit.
+        if (debugRun) {
+            double now = glfwGetTime();
+            bool inLobby = (st.phase == op2::Phase::InLobby || st.phase == op2::Phase::InGame);
+            if (dbgState == DBG_WAIT && inLobby) {
+                client.sendChat("Doing debug run, Leaving");
+                op2::debug_log("[debug] joined - posted leaving chat");
+                dbgMark = now; dbgState = DBG_SENT;
+            } else if (dbgState == DBG_WAIT && (st.phase == op2::Phase::Error || st.disconnected)) {
+                if (dbgMark == 0.0) dbgMark = now;                    // join failed - hold briefly then close
+                if (now - dbgMark > 1.5) { op2::debug_log("[debug] join failed - closing"); glfwSetWindowShouldClose(win, 1); }
+            } else if (dbgState == DBG_SENT && now - dbgMark > 2.0) {
+                op2::debug_log("[debug] leaving cleanly");
+                client.disconnect();                                  // clean lobby/in-game quit, joins worker
+                dbgMark = now; dbgState = DBG_LEAVING;
+            } else if (dbgState == DBG_LEAVING && now - dbgMark > 0.3) {
+                op2::debug_log("[debug] done - closing app");
+                glfwSetWindowShouldClose(win, 1);                     // clean window-close -> normal shutdown
+                dbgState = DBG_DONE;
+            }
+        }
+
+        // --debug <dur>: TIMED run - count down on the form, then leave cleanly and close.
+        if (timedRun && !timedLeaving && glfwGetTime() >= runSeconds) {
+            timedLeaving = true;
+            op2::debug_log("[timed] run period elapsed - leaving cleanly and closing");
+            client.disconnect();                                      // clean in-game ctQuit / lobby quit (blocks until sent)
+            glfwSetWindowShouldClose(win, 1);
+        }
 
         // one full-window panel
         const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -82,6 +183,11 @@ int main(int, char**) {
         ImGui::SameLine();
         ImGui::TextDisabled("- Outpost 2 session + command-packet logger (dev tool)");
         ImGui::TextDisabled("Joins a game like a player and logs decoded command packets -> op2sessionlogger_debug.txt");
+        if (timedRun) {
+            double remain = runSeconds - glfwGetTime(); if (remain < 0) remain = 0;
+            int rm = (int)remain / 60, rs = (int)remain % 60;
+            ImGui::TextColored(ImVec4(1.0f,0.8f,0.3f,1), "TIMED DEBUG RUN - auto-exit in %d:%02d", rm, rs);
+        }
         ImGui::Separator();
 
         // ---- identity + connection ----
@@ -122,6 +228,10 @@ int main(int, char**) {
             ImGui::Text("Host IP:  %s", st.hostIp.c_str());
             ImGui::Text("Game:     %s", st.gameName.c_str());
             ImGui::Text("Map DLL:  %s", st.lobby.mapDll.c_str());
+            if (st.lobby.tappVersion) {
+                uint32_t v = st.lobby.tappVersion;
+                ImGui::Text("Host Ver: %u.%u.%u.%u", (v>>24)&0xff, (v>>16)&0xff, (v>>8)&0xff, v&0xff);
+            }
             if (st.ourColor >= 0) {
                 ImGui::Text("Our Color:"); ImGui::SameLine();
                 ImGui::TextColored(op2_color(st.ourColor), "%s", op2::color_name(st.ourColor));

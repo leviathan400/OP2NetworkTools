@@ -89,6 +89,10 @@ public:
     // Configure the player name shown in the lobby (call before connecting). Default "OPU".
     void setPlayerName(const std::string& name);
 
+    // Override the advertised TApp::Version (call before connecting). Default TAPP_VERSION
+    // (1.4.0.1). Must match the host's version family or the host drops us after join.
+    void setTappVersion(uint32_t v);
+
     // Start a session. Either scan the LAN by broadcast, or target a specific host IP.
     // Returns false if a session is already running.
     bool connectScan();
@@ -119,6 +123,7 @@ private:
     ClientState             state_;               // guarded by mtx_
     std::vector<std::string> pendingChat_;        // guarded by mtx_
     std::string             playerName_ = "OPU";  // guarded by mtx_ (set before start)
+    uint32_t                tappVersion_ = TAPP_VERSION;  // guarded by mtx_ (set before start)
 
     // helpers (run on worker thread; lock as noted)
     void setPhase(Phase p, const std::string& status);
