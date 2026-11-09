@@ -32,8 +32,27 @@ where the protocol was cracked. Heavily diagnostic (toggle the per-packet dumps 
 
 A developer tool (same Dear ImGui base as OP2DummyPlayer) that joins a game like a player and
 **logs decoded in-game command packets** to a text file - a command-type census plus a per-command
-decode (type, unit selection, known fields, undecoded tail) for reverse-engineering the command
-set. -> [`OP2SessionLogger/README.md`](OP2SessionLogger/README.md)
+decode (type, unit selection, every payload field) covering all 55 command opcodes.
+-> [`OP2SessionLogger/README.md`](OP2SessionLogger/README.md)
+
+### OP2Spectator
+
+Joins a game as a player and **records the match** to structured files - every player's actions
+(build orders, production, research, movement, combat orders, logistics), the chat, and the roster.
+Built on the OP2SessionLogger net layer. Outpost 2 is deterministic lockstep, so it sees every
+player's *input* but not derived simulation state. -> [`OP2Spectator/README.md`](OP2Spectator/README.md)
+
+### op2finder / op2finder-py
+
+Console LAN session finders - the same discovery protocol as OP2LanScan, without the GUI. `op2finder`
+is a single-file C tool (no dependencies); `op2finder-py` is the readable Python reference
+implementation (standard library only). Both support a direct-IP query.
+-> [`op2finder/README.md`](op2finder/README.md), [`op2finder-py/README.md`](op2finder-py/README.md)
+
+### selftest
+
+A small round-trip check of the discovery query (checksum + field layout) against the spec and
+against the built OP2LanScan. -> [`selftest/README.md`](selftest/README.md)
 
 ## Reference Documents
 - [`PROTOCOL.md`](PROTOCOL.md) - the multiplayer protocol, byte-exact: discover -> join ->
