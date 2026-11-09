@@ -22,4 +22,5 @@ csc Test.cs && Test.exe
 
 Reference: the byte-exact discovery spec is [`..\DISCOVERY_PROTOCOL.md`](../DISCOVERY_PROTOCOL.md).
 
-> Note: `Test.exe` / `Probe.exe` and `*.png` here are dev artifacts (git/svn-ignored).
+> Note: `Test.exe` / `Probe.exe` are prebuilt from the `.cs` sources, and `gui_fixed.png` is a dev
+> screenshot. They're kept in the repo for convenience; rebuild the exes with `csc` as above.

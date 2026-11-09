@@ -623,7 +623,7 @@ void Client::run(bool scan, std::string targetIp) {
             // the host's reliable resends by last text.
             if (buf[0x09]==0 && n>=0x18 && buf[0x12]==6 && (buf[0x0E]&0x06) && rd32(buf+0x00)==hostNetID) {
                 uint32_t sender = rd32(buf+0x13);
-                const char* txt = (const char*)(buf+0x17);
+                std::string txt = nul_str(buf+0x17, n-0x17);
                 if (sender != assignedNetID && lastLobbyChat != txt) {
                     lastLobbyChat = txt;
                     std::string from;

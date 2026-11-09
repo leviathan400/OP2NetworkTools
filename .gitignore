@@ -1,0 +1,11 @@
+# Build output (CMake, MSBuild, MSVC)
+build/
+bin/
+obj/
+*.obj
+*.pdb
+*.ilk
+
+# Editor / IDE state
+.vs/
+.idea/
