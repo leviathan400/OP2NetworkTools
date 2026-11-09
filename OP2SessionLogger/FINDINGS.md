@@ -21,8 +21,8 @@ Three sources, cross-checked:
 Two capture rules that make decoding tractable:
 - **The sim is not on the wire.** OP2 is deterministic lockstep, so morale / population / deaths /
   disasters are computed locally on every machine and never sent. An **idle baseline** (host does
-  nothing) shows only `ctNop` + the `0x34` sync. So in a 2-player game, **every other command is the
-  host's deliberate action**.
+  nothing) shows only `ctNop` (idle keepalive) + `0x34 ctMachineSettings` (the periodic CPU/RAM/
+  resolution broadcast). So in a 2-player game, **every other command is the host's deliberate action**.
 - **Isolate one action.** Repeat a single action (e.g. self-destruct N units, or move one unit to
   several tiles); the command that appears N times is that action, and the bytes that change between
   repeats are its variable fields.
@@ -200,7 +200,7 @@ it and posts it to chat ("Host game version: 1.3.0.4") and the lobby panel shows
 to compare a 1.4.1 host (which drops our 1.3.0.4-advertising client) against a 1.3.6 host.
 
 ## Background vs player input
-- **Background** (fires even when idle): `0x00 ctNop`, `0x34` sync.
+- **Background** (fires even when idle): `0x00 ctNop` (idle keepalive), `0x34 ctMachineSettings` (the periodic CPU/RAM/resolution broadcast that feeds OP2's Network Statistics panel).
 - **Player input**: everything else. The engine sim never puts its events on the wire.
 
 ## Still to decode / confirm
@@ -296,5 +296,5 @@ exact; "?" = behaviour seen, name not pinned.
 | `0x31` | special | **quit**: mode byte at `+0x0e` (0/1); net shutdown; "At tick %i player %i..." |
 | `0x32` | special | **ally**: target player byte at `+0x04`; toggles alliance bitmask `DAT_0056ef20` |
 | `0x33` | special | announce (message `0x1fe`) |
-| `0x34` | special | **ctMachineSettings**: `player[0x130] = tail[0]`, `player[0x131] = +0x12` (sync values) |
+| `0x34` | special | **ctMachineSettings**: `player[0x130] = tail[0]`, `player[0x131] = +0x12` (machine-spec values: cpuSpeed/memoryMB/window WxH) |
 | default | - | return 0 (unknown type rejected) |

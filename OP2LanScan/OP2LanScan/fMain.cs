@@ -7,6 +7,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
+// OP2LanScan
+// https://github.com/leviathan400/OP2NetworkTools
+
 namespace OP2LanScan
 {
     public partial class fMain : Form

@@ -36,19 +36,23 @@ Beyond the usual connect / join / phase / disconnect events, while in a game it 
 The decoder (`cmd_name` / `decode_cmd` in `src/net/op2client.cpp`) follows the engine's own
 `DataStructure CommandPacket.txt` (the authoritative per-type field spec), cross-checked against the
 command executor `FUN_0040e300` and live capture. Command names are the engine's CommandType string
-table (all 55 opcodes, `ctNop`..`WeaponFiring`). It renders fields for the full command set -
+table (all 55 opcodes, `ctNop`..`WeaponFiring`). It decodes the **full command set** - every opcode is
+named, and every payload is resolved to the unit selection (or single unit) plus all per-type fields:
 the move group (`0x02`-`0x04`/`0x26`, packed `pixelX:15|pixelY:14` waypoints), build / build-wall /
-remove-wall, produce, transfer-cargo, research, train, repair/reprogram/dismantle, attack/guard,
-create, light-toggle, game-options, chat, quit, ally, and machine-settings - leaving only a handful
-of map_id enums and a couple of trailing fields as `tail:` to be pinned. The full command-packet
-write-up - block structure, the unit-selection header, packed coordinates, the type map, and the
-decoded layouts - is in [`FINDINGS.md`](FINDINGS.md).
+remove-wall (tile rects), produce, transfer-cargo, research, train, repair/reprogram/dismantle and
+attack/guard (target unit *or* ground tile), create (per-unit type + tile), launch (pixel dest),
+cargo-route, salvage (region rect), transfer, recycle, light-toggle, game-options, chat, quit, ally,
+and machine-settings. Anything unexpected (or a payload longer than modelled) still falls through to a
+hex `tail:` so nothing is silently dropped - in practice the tail is now empty for known commands. The
+full command-packet write-up - block structure, the unit-selection header, packed coordinates, the type
+map, and the decoded layouts - is in [`FINDINGS.md`](FINDINGS.md).
 For the surrounding wire/transport protocol see `..\PROTOCOL.md` / `..\FINDINGS.md`.
 
 ## How to capture cleanly
 The deterministic lockstep sim puts **nothing** on the wire except player input plus a couple of meta
-commands (`ctNop` keepalive, `0x34` sync), so in a 2-player game **every other command is the host's
-action**. To decode a specific command:
+commands (`ctNop` idle keepalive, and `ctMachineSettings` `0x34` - the periodic CPU/RAM/resolution
+broadcast), so in a 2-player game **every other command is the host's action**. To decode a specific
+command:
 
 1. Host a 2-player game; let OP2SessionLogger **Scan LAN & Join**; click START.
 2. Do **one action type, repeated** (e.g. move one unit to several far-apart tiles), spaced out.

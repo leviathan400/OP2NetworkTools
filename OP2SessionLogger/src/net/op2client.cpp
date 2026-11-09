@@ -80,9 +80,16 @@ static bool cmd_is_single(uint8_t t) {
         default: return false;
     }
 }
-// Decode a command block's data[] into a readable string: type name, the unit selection, the
-// fully-known fields, and the still-undecoded tail bytes. Field layouts are from the engine's
-// own "DataStructure CommandPacket.txt" (offsets cross-checked against live captures).
+// Decode a command block's data[] into a readable string. Every one of the 55 command opcodes is
+// named, and its payload is fully decoded: the unit selection (or single unit id), then every
+// per-type field - map coordinates (pixel waypoints and tile rects), targets (unit id or ground
+// tile), counts, and scalars. Anything left over (an unexpected/extra byte, or a payload longer
+// than we model) falls through to a hex "tail:" so nothing is silently dropped. Field layouts are
+// from the engine's own "DataStructure CommandPacket.txt", with offsets cross-checked against live
+// captures and the per-command payload structs. Structure of the three passes below:
+//   1. "special" payloads - fixed layout, no unit-selection header (chat/quit/ally/produce/...).
+//   2. header - a unit-selection list ([s8 count][u16 ids]) or a single u16 unit id.
+//   3. per-type fields that follow the header - waypoints, rects, targets, route/launch/salvage data.
 static std::string decode_cmd(uint8_t type, const uint8_t* d, int len) {
     std::string out = cmd_name(type);
     char b[96];
@@ -93,10 +100,10 @@ static std::string decode_cmd(uint8_t type, const uint8_t* d, int len) {
         snprintf(b, sizeof(b), " sender=%d mask=%02x ", (int)d[0], d[1]); out += b; out += "\"" + txt + "\"";
         return out;
     }
-    if (type == 0x31) {                              // ctQuit: [quitMethod, lParam]
+    if (type == 0x31) {                              // ctQuit: [quitMethod(u8), delay(u8) - typically 2]
         int m = len > 0 ? d[0] : -1;
         const char* mn = m==0 ? "self-destruct" : m==1 ? "transfer-to-allies" : "go-ai";
-        snprintf(b, sizeof(b), " quitMethod=%d(%s) lParam=%d", m, mn, len > 1 ? d[1] : -1);
+        snprintf(b, sizeof(b), " quitMethod=%d(%s) delay=%d", m, mn, len > 1 ? d[1] : -1);
         return out + b;
     }
     if (type == 0x32 && len >= 4) {                  // ctAlly: [allyFromPlayer(2), allyToPlayer(2)]
@@ -166,7 +173,10 @@ static std::string decode_cmd(uint8_t type, const uint8_t* d, int len) {
             out += b;
         }
     };
-    auto take_rect = [&](const char* label){         // [u16 x1,y1,x2,y2] map tiles
+    // A map rect: [u16 x1,y1,x2,y2] in TILES. Top-left is inclusive; bottom-right is inclusive for
+    // most commands, but EXCLUSIVE for ctMoBuildWall (per the engine's wall placement). We print the
+    // raw corners verbatim and don't adjust, so the bytes match the wire.
+    auto take_rect = [&](const char* label){
         if (off + 8 > len) return;
         snprintf(b, sizeof(b), " %s=(%u,%u)-(%u,%u)", label,
                  rd16(d+off), rd16(d+off+2), rd16(d+off+4), rd16(d+off+6));
@@ -176,9 +186,16 @@ static std::string decode_cmd(uint8_t type, const uint8_t* d, int len) {
     switch (type) {
         case 0x01:                                                   // ctMoDoze: rect, no waypoints
             take_rect("region"); break;
-        case 0x02: case 0x03: case 0x04: case 0x26:                  // move/dock/dockEG/standGround
-        case 0x27: case 0x28:                                        // cargoRoute/patrol (extra fields -> tail)
+        case 0x02: case 0x03: case 0x04: case 0x26: case 0x28:       // move/dock/dockEG/standGround/patrol
             take_waypoints(); break;
+        case 0x27:                                                   // ctMoCargoRoute: 3 waypoints (mine->smelter->mine) then route indices + unit ids
+            take_waypoints();
+            if (off + 8 <= len) {
+                snprintf(b, sizeof(b), " mineWp=%u smelterWp=%u mineUnit=%u smelterUnit=%u",
+                         rd16(d+off), rd16(d+off+2), rd16(d+off+4), rd16(d+off+6));
+                out += b; off += 8;
+            }
+            break;
         case 0x06:                                                   // ctMoBuild: waypoints, buildArea, FFFF
             take_waypoints(); take_rect("footprint");
             if (off + 2 <= len && rd16(d+off)==0xFFFF) off += 2;
@@ -192,6 +209,16 @@ static std::string decode_cmd(uint8_t type, const uint8_t* d, int len) {
             break;
         case 0x23:                                                   // ctMoLightToggle: headLightState
             if (off + 2 <= len) { snprintf(b, sizeof(b), " lights=%s", rd16(d+off)?"on":"off"); out += b; off += 2; }
+            break;
+        case 0x18:                                                   // ctMoTransfer: destination player
+            if (off + 2 <= len) { snprintf(b, sizeof(b), " toPlayer=%u", rd16(d+off)); out += b; off += 2; }
+            break;
+        case 0x1f:                                                   // ctMoSalvage: region rect (tiles) + gorf unit id
+            take_rect("region");
+            if (off + 2 <= len) { snprintf(b, sizeof(b), " gorf=%u", rd16(d+off)); out += b; off += 2; }
+            break;
+        case 0x0d:                                                   // ctMoRecycle: trailing field (engine "unknown")
+            if (off + 2 <= len) { snprintf(b, sizeof(b), " unk=%u", rd16(d+off)); out += b; off += 2; }
             break;
         case 0x1c: case 0x1d: case 0x1e:                             // repair/reprogram/dismantle
         case 0x24: case 0x25:                                        // attack/guard (target unit OR ground tile)
@@ -1163,7 +1190,8 @@ void Client::run(bool scan, std::string targetIp) {
                     // log each DISTINCT interesting command once so a controlled in-game action can
                     // be correlated to its bytes. Dedup on the command CONTENT (type + len + data) -
                     // NOT unk (that is a constant per-stream token, and the sliding window resends
-                    // the same block many times). Skip ctNop and the noisy sync (0x34).
+                    // the same block many times). Skip the idle heartbeat ctNop (0x00) and the
+                    // frequently-rebroadcast ctMachineSettings (0x34, CPU/RAM/resolution) - both noise.
                     if (bt != 0x00 && bt != 0x34) {
                         uint32_t h = 2166136261u;                       // FNV-1a over type + len + data
                         h = (h ^ bt) * 16777619u; h = (h ^ (uint32_t)bl) * 16777619u;
