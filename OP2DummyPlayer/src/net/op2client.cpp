@@ -2,6 +2,7 @@
 // port of the verified op2session.cpp (see ..\..\..\op2session\FINDINGS.md for the why of
 // every step), restructured behind a thread-safe state snapshot for a GUI front-end.
 #include "op2client.h"
+#include <algorithm>
 #include "socket_compat.h"
 
 #include <chrono>
@@ -18,6 +19,14 @@ namespace op2 {
 static uint64_t now_ms() {
     using namespace std::chrono;
     return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Read a NUL-terminated string from a wire buffer, never past maxLen bytes (a peer's block need
+// not actually contain the NUL).
+static std::string nul_str(const uint8_t* p, int maxLen) {
+    int len = 0;
+    while (len < maxLen && p[len]) len++;
+    return std::string((const char*)p, (size_t)len);
 }
 
 // Format a TApp::Version dword (e.g. 0x01040001 -> "1.4.0.1").
@@ -760,7 +769,7 @@ void Client::run(bool scan, std::string targetIp) {
                     // peer-turn handler below - showing it here too would duplicate it AND mislabel it
                     // with the game name (e.g. "DevHost: ..." for a message Leviathan actually sent).
                     if (buf[off]==0x30 && blen>=3 && clockNetID == hostNetID) {
-                        const char* txt = (const char*)(buf + off + 6 + 2);
+                        std::string txt = nul_str(buf + off + 6 + 2, blen - 2);
                         if (lastRecvChat != txt) { lastRecvChat = txt; std::string gn; { std::lock_guard<std::mutex> lk(mtx_); gn = state_.gameName; } addChat(gn.empty()?"host":gn, txt, false); }
                     }
                     // incoming host ALLY block (command type 0x32, `AllyWith`/FUN_0040E300). In a
@@ -780,13 +789,15 @@ void Client::run(bool scan, std::string targetIp) {
                             addChat("", "*** A PLAYER ALLIED WITH US - allying back ***", false);
                         }
                     }
-                    if (ol + 64 <= (int)sizeof(ob)) {
-                        if (chatActive && !injectedChat && blockMark==chatMark && unk!=0) {
-                            int tl=(int)chatText.size(), dl=2+tl+1;
+                    // Each branch checks its own block fits: a chat block is 6+2+text+1 bytes (up to
+                    // ~136 for a 127-char message), so a flat headroom check is not enough.
+                    const int tl = (int)std::min<size_t>(chatText.size(), 250), dl = 2+tl+1;   // dl fits the u8 length
+                    if (ol + 6 <= (int)sizeof(ob)) {
+                        if (chatActive && !injectedChat && blockMark==chatMark && unk!=0 && ol + 6 + dl <= (int)sizeof(ob)) {
                             ob[ol]=0x30; ob[ol+1]=(uint8_t)dl; wr32(ob+ol+2, unk);
                             ob[ol+6]=ourPlayerNum; ob[ol+7]=0xFF; memcpy(ob+ol+8, chatText.data(), tl); ob[ol+8+tl]=0;
                             ol += 6+dl; injectedChat=true;
-                        } else if (allyActive && !injectedAlly && blockMark==allyMark && unk!=0) {
+                        } else if (allyActive && !injectedAlly && blockMark==allyMark && unk!=0 && ol + 6 + allyDataLen <= (int)sizeof(ob)) {
                             ob[ol]=0x32; ob[ol+1]=(uint8_t)allyDataLen; wr32(ob+ol+2, unk);
                             memcpy(ob+ol+6, allyData, allyDataLen);
                             ol += 6+allyDataLen; injectedAlly=true;
@@ -830,7 +841,7 @@ void Client::run(bool scan, std::string targetIp) {
                         if (o + 6 + bl > n) break;
                         if (bt == 0x30 && bl >= 3 && lsrc != hostNetID) {
                             // in-game chat: data = [sender(1), recipientMask(1), text, NUL].
-                            const char* txt = (const char*)(buf + o + 6 + 2);
+                            std::string txt = nul_str(buf + o + 6 + 2, bl - 2);
                             if (lastChatBySlot[lslot] != txt) { lastChatBySlot[lslot] = txt; addChat(nm, txt, false); }
                         } else if (bt == 0x31 && !playerLeft[lslot]) {   // ctQuit - this player left
                             playerLeft[lslot] = true;

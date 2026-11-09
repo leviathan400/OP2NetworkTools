@@ -2,6 +2,7 @@
 // port of the verified op2session.cpp (see ..\..\..\op2session\FINDINGS.md for the why of
 // every step), restructured behind a thread-safe state snapshot for a GUI front-end.
 #include "op2client.h"
+#include <algorithm>
 #include "socket_compat.h"
 
 #include <chrono>
@@ -1070,13 +1071,15 @@ void Client::run(bool scan, std::string targetIp) {
                             addChat("", "*** A PLAYER ALLIED WITH US - allying back ***", false);
                         }
                     }
-                    if (ol + 64 <= (int)sizeof(ob)) {
-                        if (chatActive && !injectedChat && blockMark==chatMark && unk!=0) {
-                            int tl=(int)chatText.size(), dl=2+tl+1;
+                    // Each branch checks its own block fits: a chat block is 6+2+text+1 bytes (up to
+                    // ~136 for a 127-char message), so a flat headroom check is not enough.
+                    const int tl = (int)std::min<size_t>(chatText.size(), 250), dl = 2+tl+1;   // dl fits the u8 length
+                    if (ol + 6 <= (int)sizeof(ob)) {
+                        if (chatActive && !injectedChat && blockMark==chatMark && unk!=0 && ol + 6 + dl <= (int)sizeof(ob)) {
                             ob[ol]=0x30; ob[ol+1]=(uint8_t)dl; wr32(ob+ol+2, unk);
                             ob[ol+6]=ourPlayerNum; ob[ol+7]=0xFF; memcpy(ob+ol+8, chatText.data(), tl); ob[ol+8+tl]=0;
                             ol += 6+dl; injectedChat=true;
-                        } else if (allyActive && !injectedAlly && blockMark==allyMark && unk!=0) {
+                        } else if (allyActive && !injectedAlly && blockMark==allyMark && unk!=0 && ol + 6 + allyDataLen <= (int)sizeof(ob)) {
                             ob[ol]=0x32; ob[ol+1]=(uint8_t)allyDataLen; wr32(ob+ol+2, unk);
                             memcpy(ob+ol+6, allyData, allyDataLen);
                             ol += 6+allyDataLen; injectedAlly=true;

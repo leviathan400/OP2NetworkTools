@@ -751,7 +751,10 @@ int main(int argc, char** argv) {
                     // (b) incoming chat from the host (block type 0x30:
                     // data = [sender(1)][recipientMask(1)][text NUL]); text starts at data+2.
                     if (buf[off] == 0x30 && blen >= 3) {
-                        const char* txt = (const char*)(buf + off + 6 + 2);
+                        // bounded copy: the block need not contain the NUL, so never read past blen
+                        char txt[200] = {0};
+                        int tl = 0; const uint8_t* src = buf + off + 6 + 2;
+                        while (tl < blen - 2 && tl < (int)sizeof(txt)-1 && src[tl]) { txt[tl] = (char)src[tl]; tl++; }
                         if (strncmp(txt, lastRecvChat, sizeof(lastRecvChat)-1) != 0) {
                             strncpy(lastRecvChat, txt, sizeof(lastRecvChat)-1);
                             printf("\n[in-game chat] %s: %s\n", g.name[0]?g.name:"host", txt);
