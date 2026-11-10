@@ -1015,6 +1015,19 @@ void Client::run(bool scan, std::string targetIp) {
                     char nb[16]; snprintf(nb, sizeof(nb), "%08X", dst);
                     debug_log(std::string("host cmd-0x05 (player removed): netID=") + nb
                               + (dst==assignedNetID ? " (us)" : who.empty() ? "" : (" '" + who + "'")));
+                    // Addressed to US while we sit in the lobby and aren't leaving ourselves = the
+                    // host removed us (kick, or a version eject). Disconnect now instead of waiting
+                    // out the 4 s host-silence timeout below. (A clean quit of our own also draws
+                    // this 0x05, hence the leaving_/sendQuit_ guard; in-game it's ignored.)
+                    if (dst == assignedNetID && lobbyJoined && !gameStarting && !gameLive
+                        && !leaving_ && !sendQuit_) {
+                        if (verMismatch)
+                            setDisconnected("Ejected: wrong game version. Host is " + ver_str(hostTappVer)
+                                            + ", we sent " + ver_str(myVer) + ". Pass --ver " + ver_str(hostTappVer) + ".");
+                        else
+                            setDisconnected("Removed from the lobby by the host.");
+                        break;
+                    }
                 }
             }
             // lobby/connection EVENTS (sequenced host packet, engine cmd at 0x12)
