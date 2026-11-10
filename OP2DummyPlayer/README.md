@@ -10,19 +10,22 @@ same, verified live against a retail Outpost 2 host.
 
 ## Architecture - net and GUI are cleanly separated
 ```
+../common/op2net/      <- the SHARED net-client library (op2net), also used by OP2SessionLogger
+                          and OP2Spectator. NO GUI dependency.
+  socket_compat.h      <- Winsock <-> POSIX UDP shim
+  op2proto.h/.cpp      <- pure wire helpers: constants, checksums, GameStartInfo decode
+  op2client.h/.cpp     <- threaded client: discover -> join -> lobby -> start -> in-game,
+                          exposing a thread-safe ClientState snapshot + simple commands, plus
+                          ClientOptions / ClientHooks for per-app behaviour
 src/
-  net/                 <- the net-client library (op2net). NO GUI dependency.
-    socket_compat.h    <- Winsock <-> POSIX UDP shim
-    op2proto.h/.cpp    <- pure wire helpers: constants, checksums, GameStartInfo decode
-    op2client.h/.cpp   <- threaded client: discover -> join -> lobby -> start -> in-game,
-                          exposing a thread-safe ClientState snapshot + simple commands
   gui/
     main.cpp           <- Dear ImGui (GLFW + OpenGL3). Reads snapshots, calls commands.
-CMakeLists.txt         <- builds op2net (standalone) + the GUI; fetches ImGui + GLFW
+CMakeLists.txt         <- pulls in op2net + builds the GUI; fetches ImGui + GLFW
 winbuild.bat           <- one-click Windows build via the VS-bundled CMake + Ninja
 ```
 The GUI never touches a socket or a wire byte. `op2net` builds and links on its own, so it can
-also back a CLI, automated tests, or a different UI toolkit later.
+also back a CLI, automated tests, or a different UI toolkit later. A protocol fix lands once in
+`common/op2net` and every app picks it up.
 
 ### The boundary (what the GUI uses)
 ```cpp

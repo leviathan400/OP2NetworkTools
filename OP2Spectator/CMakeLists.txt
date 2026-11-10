@@ -19,21 +19,10 @@ endif()
 include(FetchContent)
 
 # ---------------------------------------------------------------------------
-# op2net - the net-client library. NO GUI dependency: this builds and links on
-# its own and could back a CLI, tests, or any other front-end.
+# op2net - the shared net-client library (common/op2net), also used by the other
+# OP2NetworkTools GUI apps. NO GUI dependency.
 # ---------------------------------------------------------------------------
-add_library(op2net STATIC
-  src/net/op2proto.cpp
-  src/net/op2client.cpp
-)
-target_include_directories(op2net PUBLIC src/net)
-find_package(Threads REQUIRED)
-target_link_libraries(op2net PUBLIC Threads::Threads)
-if(WIN32)
-  target_link_libraries(op2net PUBLIC ws2_32)
-  # We intentionally use the simple, portable BSD-style APIs (gethostbyname/inet_addr/strncpy).
-  target_compile_definitions(op2net PRIVATE _WINSOCK_DEPRECATED_NO_WARNINGS _CRT_SECURE_NO_WARNINGS)
-endif()
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../common/op2net ${CMAKE_CURRENT_BINARY_DIR}/op2net)
 
 # ---------------------------------------------------------------------------
 # Dependencies for the GUI (fetched so it builds out-of-the-box on Win + Linux).

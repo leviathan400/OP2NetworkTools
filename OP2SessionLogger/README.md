@@ -33,7 +33,7 @@ Beyond the usual connect / join / phase / disconnect events, while in a game it 
   CMD 0x09 slot=0 exec=488  len=8   ctMoProduce factory=14 item=144 weapon=0 stub=-1
   ```
 
-The decoder (`cmd_name` / `decode_cmd` in `src/net/op2client.cpp`) follows the engine's own
+The decoder (`cmd_name` / `decode_cmd` in `../common/op2net/op2client.cpp`) follows the engine's own
 `DataStructure CommandPacket.txt` (the authoritative per-type field spec), cross-checked against the
 command executor `FUN_0040e300` and live capture. Command names are the engine's CommandType string
 table (all 55 opcodes, `ctNop`..`WeaponFiring`). It decodes the **full command set** - every opcode is
@@ -115,5 +115,6 @@ write-up in [`NETPLAY.md`](NETPLAY.md).
 - **OP2DummyPlayer** = the clean, user-facing client (join, ready, play, chat, leave).
 - **OP2SessionLogger** = this dev tool: the same client plus the command-logging diagnostics.
 
-The two currently keep their own copy of the net-client (`src/net/`). When the protocol layer
-changes, apply the change to both.
+Both (and OP2Spectator) build on the one shared net-client library, `../common/op2net`. This app
+turns on its command census with `ClientOptions::commandCensus`; a protocol fix there reaches all
+three apps.

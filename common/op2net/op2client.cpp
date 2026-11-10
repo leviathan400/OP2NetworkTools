@@ -1,4 +1,4 @@
-// op2client.cpp - the threaded OP2 multiplayer client. The protocol logic here is a direct
+// op2client.cpp - the threaded OP2 multiplayer client (shared library: common/op2net). The protocol logic here is a direct
 // port of the verified op2session.cpp (see ..\..\..\op2session\FINDINGS.md for the why of
 // every step), restructured behind a thread-safe state snapshot for a GUI front-end.
 #include "op2client.h"
@@ -21,25 +21,229 @@ static uint64_t now_ms() {
     return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Read a NUL-terminated string from a wire buffer, never past maxLen bytes (a peer's block need
-// not actually contain the NUL).
+// Extract a NUL-terminated string from network data without trusting the terminator: stops at
+// the first NUL or after maxLen bytes, whichever comes first. Packets are untrusted input - a
+// missing NUL must never read past the received bytes.
 static std::string nul_str(const uint8_t* p, int maxLen) {
     int len = 0;
     while (len < maxLen && p[len]) len++;
     return std::string((const char*)p, (size_t)len);
 }
 
-// Format a TApp::Version dword (e.g. 0x01040001 -> "1.4.0.1").
+// Format a TApp::Version dword (e.g. 0x01030004 -> "1.3.0.4").
 static std::string ver_str(uint32_t v) {
     char b[24];
     snprintf(b, sizeof(b), "%u.%u.%u.%u", (v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff);
     return b;
 }
 
+// ---- in-game command decoding ----------------------------------------------
+// Derived from the engine command executor (FUN_0040e300) and its unit-selection helpers
+// (FUN_00490920 = count, FUN_00490960 = id list). A command block is `type len unk data[len]`;
+// these decode `data`. The names are the engine's own CommandType string table (decompile
+// string VAs 0x004e0f10-0x004e11fc, see OP2KB command_packet_opcodes.tsv) - canonical, not
+// guessed.
+static const char* cmd_name(uint8_t t) {
+    static const char* names[0x37] = {
+        /*0x00*/ "ctNop",            "ctMoDoze",          "ctMoMove",        "ctMoDock",
+        /*0x04*/ "ctMoDockEG",       "ctMoStop",          "ctMoBuild",       "ctMoBuildWall",
+        /*0x08*/ "ctMoRemoveWall",   "ctMoProduce",       "ctMoTransferCargo","ctMoLoadCargo",
+        /*0x0c*/ "ctMoUnloadCargo",  "ctMoRecycle",       "ctMoDumpCargo",   "ctMoScavenge",
+        /*0x10*/ "ctMoSpecialWait",  "ctMoSurvey",        "ctMoIdle",        "ctMoUnIdle",
+        /*0x14*/ "ctMoSelfDestruct", "ctMoScatter",       "ctMoResearch",    "ctMoTrainScientists",
+        /*0x18*/ "ctMoTransfer",     "ctMoLaunch",        "ctMoFlyInSpace",  "ctMoRepair",
+        /*0x1c*/ "ctMoRepairObj",    "ctMoReprogram",     "ctMoDismantle",   "ctMoSalvage",
+        /*0x20*/ "ctMoCreate",       "ctMoDevelop",       "ctMoUnDevelop",   "ctMoLightToggle",
+        /*0x24*/ "ctMoAttackObj",    "ctMoGuard",         "ctMoStandGround", "ctMoCargoRoute",
+        /*0x28*/ "ctMoPatrol",       "ctMapChange",       "ctMoPoof",        "ctGameOpt",
+        /*0x2c*/ "ctGodWeapon",      "ctChatText",        "ctChatSFX",       "ctMoDeath",
+        /*0x30*/ "ctChat",           "ctQuit",            "ctAlly",          "ctGoAI",
+        /*0x34*/ "ctMachineSettings","ctInvalidCommand",  "WeaponFiring",
+    };
+    return t < 0x37 ? names[t] : "ct?";
+}
+// data begins with a unit-selection list ([count s8][u16 ids]) - the cases that call the
+// selection helpers in the executor.
+static bool cmd_is_selection(uint8_t t) {
+    switch (t) {
+        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
+        case 0x14: case 0x15: case 0x18: case 0x1c: case 0x1d: case 0x1e:
+        case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x28: return true;
+        default: return false;
+    }
+}
+// data begins with a single u16 unit id - the cases that read *(short*)data directly.
+static bool cmd_is_single(uint8_t t) {
+    switch (t) {
+        case 9: case 0xa: case 0xb: case 0xc: case 0xd: case 0xe:
+        case 0x12: case 0x13: case 0x16: case 0x17: case 0x19: case 0x1f: case 0x2a: return true;
+        default: return false;
+    }
+}
+// Decode a command block's data[] into a readable string. Every one of the 55 command opcodes is
+// named, and its payload is fully decoded: the unit selection (or single unit id), then every
+// per-type field - map coordinates (pixel waypoints and tile rects), targets (unit id or ground
+// tile), counts, and scalars. Anything left over (an unexpected/extra byte, or a payload longer
+// than we model) falls through to a hex "tail:" so nothing is silently dropped. Field layouts are
+// from the engine's own "DataStructure CommandPacket.txt", with offsets cross-checked against live
+// captures and the per-command payload structs. Structure of the three passes below:
+//   1. "special" payloads - fixed layout, no unit-selection header (chat/quit/ally/produce/...).
+//   2. header - a unit-selection list ([s8 count][u16 ids]) or a single u16 unit id.
+//   3. per-type fields that follow the header - waypoints, rects, targets, route/launch/salvage data.
+static std::string decode_cmd(uint8_t type, const uint8_t* d, int len) {
+    std::string out = cmd_name(type);
+    char b[96];
+
+    // ---- "special" payloads: no unit-selection header, fixed field layout ----
+    if (type == 0x30 && len >= 2) {                  // ctChat: [srcPlayer, destMask, text NUL]
+        std::string txt = nul_str(d + 2, len - 2);
+        snprintf(b, sizeof(b), " sender=%d mask=%02x ", (int)d[0], d[1]); out += b; out += "\"" + txt + "\"";
+        return out;
+    }
+    if (type == 0x31) {                              // ctQuit: [quitMethod(u8), delay(u8) - typically 2]
+        int m = len > 0 ? d[0] : -1;
+        const char* mn = m==0 ? "self-destruct" : m==1 ? "transfer-to-allies" : "go-ai";
+        snprintf(b, sizeof(b), " quitMethod=%d(%s) delay=%d", m, mn, len > 1 ? d[1] : -1);
+        return out + b;
+    }
+    if (type == 0x32 && len >= 4) {                  // ctAlly: [allyFromPlayer(2), allyToPlayer(2)]
+        snprintf(b, sizeof(b), " from=%u to=%u", rd16(d), rd16(d+2)); return out + b;
+    }
+    if (type == 0x34 && len >= 8) {                  // ctMachineSettings: cpuSpeed, physMem(MB), winW, winH
+        snprintf(b, sizeof(b), " cpuMHz=%u memMB=%u win=%ux%u", rd16(d), rd16(d+2), rd16(d+4), rd16(d+6));
+        return out + b;
+    }
+    if (type == 0x09 && len >= 8) {                  // ctMoProduce: factory, item, weapon, scStubIndex(-1=none)
+        snprintf(b, sizeof(b), " factory=%u item=%u weapon=%u stub=%d",
+                 rd16(d), rd16(d+2), rd16(d+4), (int)(int16_t)rd16(d+6));
+        return out + b;
+    }
+    if (type == 0x0a && len >= 4) {                  // ctMoTransferCargo: buildingUnit, bay, (0000)
+        snprintf(b, sizeof(b), " building=%u bay=%u", rd16(d), rd16(d+2)); return out + b;
+    }
+    if (type == 0x16 && len >= 6) {                  // ctMoResearch: lab, techNum, numScientists
+        snprintf(b, sizeof(b), " lab=%u tech=%u scientists=%u", rd16(d), rd16(d+2), rd16(d+4));
+        return out + b;
+    }
+    if (type == 0x17 && len >= 4) {                  // ctMoTrainScientists: university, numTrained
+        snprintf(b, sizeof(b), " university=%u count=%u", rd16(d), rd16(d+2)); return out + b;
+    }
+    if (type == 0x19 && len >= 6) {                  // ctMoLaunch: unit, destPixelX, destPixelY (plain u16s)
+        snprintf(b, sizeof(b), " unit=%u dest=(%u,%u)", rd16(d), rd16(d+2), rd16(d+4)); return out + b;
+    }
+    if (type == 0x2b && len >= 6) {                  // ctGameOpt: (unknown), variableId, newValue, [player]
+        snprintf(b, sizeof(b), " var=%u value=%u", rd16(d+2), rd16(d+4)); out += b;
+        if (len >= 8) { snprintf(b, sizeof(b), " player=%u", rd16(d+6)); out += b; }
+        return out;
+    }
+    if (type == 0x20 && len >= 2) {                  // ctMoCreate: numUnits, CreateUnitInfo[12]{type,tileX,tileY,wpn}
+        int nu = rd16(d); snprintf(b, sizeof(b), " create=%d", nu); out += b;
+        int o = 2;
+        for (int i = 0; i < nu && o + 12 <= len; i++, o += 12) {
+            snprintf(b, sizeof(b), " [type=%u at=(%u,%u) wc=%u]",
+                     rd32(d+o), rd16(d+o+4), rd16(d+o+6), rd32(d+o+8));
+            out += b;
+        }
+        return out;
+    }
+
+    // ---- header: a unit selection ([s8 count][u16 ids]) or a single u16 unit id ----
+    int off = 0;
+    if (cmd_is_selection(type) && len >= 1) {
+        int sc = (int8_t)d[0];
+        if (sc > 0 && 1 + sc * 2 <= len) {
+            out += " sel=[";
+            for (int i = 0; i < sc; i++) { snprintf(b, sizeof(b), "%s%u", i ? "," : "", rd16(d + 1 + i * 2)); out += b; }
+            out += "]"; off = 1 + sc * 2;
+        } else { snprintf(b, sizeof(b), " sel=group(%d)", sc); out += b; off = 1; }
+    } else if (cmd_is_single(type) && len >= 2) {
+        snprintf(b, sizeof(b), " unit=%u", rd16(d)); out += b; off = 2;
+    }
+
+    // ---- per-type fields that follow the selection ----
+    // A waypoint list: [u16 numWayPoints] then that many packed coords. Each coord is a u32 with
+    // pixelX in the low 15 bits and pixelY in the next 14 (NOT two u16s - the old reading halved Y
+    // and mis-read X's high bit as a "unit-target" flag; it is really pixelY's low bit).
+    auto take_waypoints = [&](){
+        if (off + 2 > len) return;
+        int nwp = rd16(d + off); off += 2;
+        for (int i = 0; i < nwp && off + 4 <= len; i++, off += 4) {
+            uint32_t v = rd32(d + off);
+            snprintf(b, sizeof(b), "%s(%u,%u)", i ? "," : " to=", v & 0x7FFF, (v >> 15) & 0x3FFF);
+            out += b;
+        }
+    };
+    // A map rect: [u16 x1,y1,x2,y2] in TILES. Top-left is inclusive; bottom-right is inclusive for
+    // most commands, but EXCLUSIVE for ctMoBuildWall (per the engine's wall placement). We print the
+    // raw corners verbatim and don't adjust, so the bytes match the wire.
+    auto take_rect = [&](const char* label){
+        if (off + 8 > len) return;
+        snprintf(b, sizeof(b), " %s=(%u,%u)-(%u,%u)", label,
+                 rd16(d+off), rd16(d+off+2), rd16(d+off+4), rd16(d+off+6));
+        out += b; off += 8;
+    };
+
+    switch (type) {
+        case 0x01:                                                   // ctMoDoze: rect, no waypoints
+            take_rect("region"); break;
+        case 0x02: case 0x03: case 0x04: case 0x26: case 0x28:       // move/dock/dockEG/standGround/patrol
+            take_waypoints(); break;
+        case 0x27:                                                   // ctMoCargoRoute: 3 waypoints (mine->smelter->mine) then route indices + unit ids
+            take_waypoints();
+            if (off + 8 <= len) {
+                snprintf(b, sizeof(b), " mineWp=%u smelterWp=%u mineUnit=%u smelterUnit=%u",
+                         rd16(d+off), rd16(d+off+2), rd16(d+off+4), rd16(d+off+6));
+                out += b; off += 8;
+            }
+            break;
+        case 0x06:                                                   // ctMoBuild: waypoints, buildArea, FFFF
+            take_waypoints(); take_rect("footprint");
+            if (off + 2 <= len && rd16(d+off)==0xFFFF) off += 2;
+            break;
+        case 0x08:                                                   // ctMoRemoveWall: waypoints, tube rect
+            take_waypoints(); take_rect("region"); break;
+        case 0x07:                                                   // ctMoBuildWall: rect, map_id kind, 0000
+            take_rect("region");
+            if (off + 2 <= len) { snprintf(b, sizeof(b), " kind=%u", rd16(d+off)); out += b; off += 2; }
+            if (off + 2 <= len && rd16(d+off)==0) off += 2;
+            break;
+        case 0x23:                                                   // ctMoLightToggle: headLightState
+            if (off + 2 <= len) { snprintf(b, sizeof(b), " lights=%s", rd16(d+off)?"on":"off"); out += b; off += 2; }
+            break;
+        case 0x18:                                                   // ctMoTransfer: destination player
+            if (off + 2 <= len) { snprintf(b, sizeof(b), " toPlayer=%u", rd16(d+off)); out += b; off += 2; }
+            break;
+        case 0x1f:                                                   // ctMoSalvage: region rect (tiles) + gorf unit id
+            take_rect("region");
+            if (off + 2 <= len) { snprintf(b, sizeof(b), " gorf=%u", rd16(d+off)); out += b; off += 2; }
+            break;
+        case 0x0d:                                                   // ctMoRecycle: trailing field (engine "unknown")
+            if (off + 2 <= len) { snprintf(b, sizeof(b), " unk=%u", rd16(d+off)); out += b; off += 2; }
+            break;
+        case 0x1c: case 0x1d: case 0x1e:                             // repair/reprogram/dismantle
+        case 0x24: case 0x25:                                        // attack/guard (target unit OR ground tile)
+            if (off + 2 <= len && rd16(d+off)==0) off += 2;          // leading 0000
+            if (off + 4 <= len) {
+                uint16_t t = rd16(d+off), t2 = rd16(d+off+2);
+                if (t2 == 0xFFFF) snprintf(b, sizeof(b), " target-unit=%u", t);
+                else              snprintf(b, sizeof(b), " target-tile=(%u,%u)", t, t2);
+                out += b; off += 4;
+            }
+            break;
+        default: break;
+    }
+
+    if (off < len) {
+        out += " tail:";
+        for (int i = off; i < len && i < off + 24; i++) { snprintf(b, sizeof(b), " %02x", d[i]); out += b; }
+    }
+    return out;
+}
+
 // ---- debug log -------------------------------------------------------------
 // Directory containing the running executable (with trailing separator), so the log lands
 // next to the exe regardless of the working directory.
-static std::string exe_dir() {
+std::string exe_dir() {
 #ifdef _WIN32
     char buf[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, buf, MAX_PATH);
     std::string p(buf, (size_t)n);
@@ -68,11 +272,18 @@ static std::string log_stamp() {
     return b;
 }
 
+static std::mutex g_logMtx;
+static std::string g_logName = "op2net_debug.txt";   // guarded by g_logMtx
+
+void set_debug_log_name(const std::string& fileName) {
+    std::lock_guard<std::mutex> lk(g_logMtx);
+    if (!fileName.empty()) g_logName = fileName;
+}
+
 void debug_log(const std::string& line) {
-    static std::mutex logMtx;
-    static std::string path;
-    std::lock_guard<std::mutex> lk(logMtx);
-    if (path.empty()) path = exe_dir() + "op2dummyplayer_debug.txt";
+    std::lock_guard<std::mutex> lk(g_logMtx);
+    // Apps pass a lowercase name so it matches the docs on case-sensitive filesystems.
+    std::string path = exe_dir() + g_logName;
     std::ofstream f(path, std::ios::app);
     if (f) f << log_stamp() << "  " << line << "\n";
 }
@@ -140,6 +351,14 @@ void Client::setPlayerName(const std::string& name) {
     if (!name.empty()) playerName_ = name.substr(0, 12);
 }
 
+void Client::setOptions(const ClientOptions& o) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!running_) opts_ = o;
+}
+void Client::setHooks(const ClientHooks& h) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!running_) hooks_ = h;
+}
 void Client::setTappVersion(uint32_t v) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (v) tappVersion_ = v;
@@ -207,10 +426,14 @@ void Client::setPhase(Phase p, const std::string& status) {
     state_.statusText = status;
 }
 void Client::addChat(const std::string& from, const std::string& text, bool self) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    ChatLine c; c.ts = hhmm(); c.from = from; c.text = text; c.self = self;
-    state_.chat.push_back(c);
-    if (state_.chat.size() > 500) state_.chat.erase(state_.chat.begin());
+    int tick;
+    { std::lock_guard<std::mutex> lk(mtx_);
+      ChatLine c; c.ts = hhmm(); c.from = from; c.text = text; c.self = self;
+      state_.chat.push_back(c);
+      if (state_.chat.size() > 500) state_.chat.erase(state_.chat.begin());
+      tick = state_.gameStarted ? state_.gameTick : -1; }
+    // Observers get every chat / system line (worker thread, outside the state lock).
+    if (hooks_.onChat) hooks_.onChat(tick, from, text, self);
 }
 void Client::setDisconnected(const std::string& reason) {
     debug_log(std::string("[disconnect] ") + reason);
@@ -293,6 +516,7 @@ void Client::run(bool scan, std::string targetIp) {
     debug_log("discovered host " + ip_str(hostIp) + " game '" + gameName + "' maxPlayers=" + std::to_string(maxPlayers));
     { std::lock_guard<std::mutex> lk(mtx_);
       state_.hostIp = ip_str(hostIp); state_.gameName = gameName; }
+    if (hooks_.onSessionBegin) hooks_.onSessionBegin(ip_str(hostIp), gameName);
 
     // ---- 2) bind our game socket to the local IP, first free 47800-47807 ----
     op2_sock_t gs = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -302,30 +526,31 @@ void Client::run(bool scan, std::string targetIp) {
     // ports conflict cleanly instead of co-existing (on Windows a wildcard bind and a specific-IP bind
     // to the same UDP port co-exist, and the most-specific socket silently STEALS the traffic):
     //   - Host with NetHelper ON binds WILDCARD (0.0.0.0). We bind WILDCARD too: wildcard-vs-wildcard
-    //     conflicts, so we skip the host's/peers' occupied ports. (A specific bind would co-exist with
-    //     the host's wildcard 47800 and steal its traffic - the original 1.4.1 lobby-drop bug.)
-    //   - Host with NetHelper OFF (vanilla) binds SPECIFIC-IP. We bind SPECIFIC to our local IP:
-    //     specific-vs-specific conflicts cleanly, so we skip 47800 and a later real client skips us.
-    //     (A wildcard bind here co-exists with the host's - and a 3rd player's - specific bind and
-    //     loses/steals traffic: "host stopped responding" / "Connecting to session failed".)
-    // The determinant is NetHelper ON/OFF, NOT the game version, so we DETECT the host's style by probe:
-    // try a throwaway WILDCARD bind to the host's game port (47800) - it FAILS if the host already holds
-    // 47800 wildcard (NetHelper ON), SUCCEEDS if specific-bound (co-exists) or free (NetHelper OFF).
-    // `--ver` is independent (game VERSION we advertise, not the bind mode). When the host is on THIS
-    // machine we also skip 47800. Full root-cause writeup in ..\OP2SessionLogger\NETPLAY.md.
+    //     conflicts, so we skip the host's/peers' occupied ports. (A specific bind here would co-exist
+    //     with the host's wildcard 47800 and steal its traffic - the original 1.4.1 lobby-drop bug.)
+    //   - Host with NetHelper OFF (vanilla) binds SPECIFIC-IP (10.x:47800). We bind SPECIFIC to our own
+    //     local IP: specific-vs-specific conflicts cleanly, so we skip 47800 and a later real client
+    //     skips us. (A wildcard bind here co-exists with the host's - and a 3rd player's - specific bind
+    //     and loses/steals traffic: "host stopped responding" / "Connecting to session failed".)
+    // The determinant is NetHelper ON/OFF, NOT the game version (NetHelper can be toggled independently),
+    // so we DETECT the host's style by probe instead of inferring it: try a throwaway WILDCARD bind to
+    // the host's game port (47800). It FAILS if the host already holds 47800 wildcard (NetHelper ON), and
+    // SUCCEEDS if the host is specific-bound (co-exists) or the port is free (NetHelper OFF). Decisive on
+    // the same machine (the only case that matters); cross-machine the port is free so it reads OFF, which
+    // is harmless. `--ver` is independent (it picks the game VERSION we advertise, not the bind mode).
     bool nethelper;
     {
         op2_sock_t probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         nethelper = false;
         if (probe != OP2_INVALID_SOCK) {
             sockaddr_in pa{}; pa.sin_family = AF_INET; pa.sin_addr.s_addr = INADDR_ANY; pa.sin_port = htons((uint16_t)GAME_PORT_LO);
-            nethelper = (bind(probe, (sockaddr*)&pa, sizeof(pa)) != 0);   // fails => host holds 47800 wildcard => NetHelper ON
+            nethelper = (bind(probe, (sockaddr*)&pa, sizeof(pa)) != 0);   // wildcard bind fails => host holds 47800 wildcard => NetHelper ON
             close_sock(probe);
         }
     }
-    bool sameMachine = (localIp != 0 && localIp == hostIp);
+    bool sameMachine = (localIp != 0 && localIp == hostIp);       // host on this box -> skip its 47800
     uint32_t bindAddr = nethelper ? INADDR_ANY : (localIp ? localIp : INADDR_ANY);
-    int loPort = sameMachine ? GAME_PORT_LO + 1 : GAME_PORT_LO;
+    int loPort = sameMachine ? GAME_PORT_LO + 1 : GAME_PORT_LO;   // same machine: never bind the host's 47800
     uint16_t ourPort = 0;
     for (int p = loPort; p <= GAME_PORT_HI; p++) {
         sockaddr_in la{}; la.sin_family = AF_INET;
@@ -456,7 +681,9 @@ void Client::run(bool scan, std::string targetIp) {
         sendto(gs,(char*)p,14+5,0,(sockaddr*)&gameAddr,sizeof(gameAddr));
     };
     auto send_cmd0c = [&](uint32_t execTick, const uint8_t* blocks, int blocksLen){
-        if (blocksLen < 6) blocksLen = 6; if (blocksLen > 500) blocksLen = 500;
+        // payloadSize is a single byte on the wire (p[0x08]), so blocks must fit 255-10 = 245
+        // bytes - a larger clamp would silently wrap the size field and corrupt the packet.
+        if (blocksLen < 6) blocksLen = 6; if (blocksLen > 245) blocksLen = 245;
         int payloadSize = 10 + blocksLen, total = 14 + payloadSize;
         uint8_t p[600]; memset(p, 0, total);
         wr32(p+0x00, assignedNetID);
@@ -493,11 +720,20 @@ void Client::run(bool scan, std::string targetIp) {
     // ---- lobby/game state machine ----
     bool lobbyJoined=false, gameStarting=false, gameLive=false;
     bool loadedSent=false;
+    bool seenSelfInLobby=false;   // once the host's roster has listed our netId, its disappearance = a drop
     bool hostVerShown=false;      // post the host's TApp version to chat once
+    bool hostPortLogged=false;    // log the host's game socket ip:port once
+    uint32_t lastCmd05Dst=0xFFFFFFFFu;   // de-dup the host's "player removed" (cmd-0x05) resends
     uint32_t hostTappVer=0;       // host's TApp::Version from the GSI
     bool verMismatch=false;       // our advertised version != the host's (the host will eject us)
     uint64_t lastHostRecv=now_ms();   // last packet whose source IS the host (for the lobby-silence drop)
     LobbyInfo prevLobby;
+    // Tell observers the game has started (final roster + host facts). Called once per game.
+    auto fireGameStart = [&](){
+        if (!hooks_.onGameStart) return;
+        LobbyInfo lb; { std::lock_guard<std::mutex> lk(mtx_); lb = state_.lobby; }
+        hooks_.onGameStart(lb, hostTappVer, nethelper, (int)ourPlayerNum);
+    };
     // in-game tick + chat tracking (see FINDINGS.md #13-15)
     bool haveFirstExec=false, haveLastExec=false;
     int  firstExec=0, maxExec=0, lookahead=0, gameTick=0, cppi=4, lastExec=0, maxSentMark=-1000000;
@@ -522,6 +758,12 @@ void Client::run(bool scan, std::string targetIp) {
     uint32_t clockNetID = hostNetID; int clockSlot = (int)(hostNetID & 7);
     uint64_t lastTurnMsBySlot[6] = {0,0,0,0,0,0};                 // last cmd-0x0C seen from each slot
     uint64_t lastCmdTurnMs=0;                                     // last turn from the clock (game-end / failover timing)
+    // DEBUG (master/resync capture): when the master leaves a 3-player game, the real engine runs a
+    // TM_RESYNC_MASTER election (type-1 control codes 0x0B/0x0D/0x0E/0x0F). These two help us see, in
+    // the log, whether that traffic appears and where in-game turns actually source from after a
+    // host-leave - i.e. whether the topology is master-relay or peer-direct.
+    uint32_t resyncCcSeen=0;                                      // dedup type-1 control codes outside the lobby set
+    bool loggedTurnSrcSlot[6]={false,false,false,false,false,false};  // log each distinct in-game turn source once
     // Map a lobby slot (0-5) back to its full netID: the host owns slot (hostNetID & 7); every other
     // slot is looked up in the cmd-4 peer roster. Returns 0 if no player occupies that slot.
     auto netIDForSlot = [&](int s) -> uint32_t {
@@ -560,18 +802,58 @@ void Client::run(bool scan, std::string targetIp) {
     uint64_t lastKeep=0, lastRecv=now_ms(), leaveStartMs=0;
     uint8_t leaveBuf[200]; int leaveBufLen=0, leaveExec=0;   // pre-built goodbye+ctQuit leave turn
 
+    // Command-type census (recon): tally every command type we receive from the game (any player
+    // but our own echo), with a length range and a byte sample per type, to learn which gameplay
+    // commands actually appear during a real session. Dumped to the debug log every 30 s and at
+    // the end. Counts include sliding-window resends (the same block rides several turns), so they
+    // measure presence/frequency, not distinct command totals.
+    struct CmdStat { long count; int minLen, maxLen, sampleLen; uint8_t sample[24]; };
+    CmdStat cstats[256] = {};
+    uint64_t lastStatDump = 0;
+    uint32_t recentCmd[128] = {0}; int recentCmdPos = 0;   // dedup ring (content hash) for per-command capture
+    auto dumpCmdStats = [&](const char* when){
+        int kinds = 0; long total = 0;
+        for (int t = 0; t < 256; t++) if (cstats[t].count) { kinds++; total += cstats[t].count; }
+        if (!kinds) return;
+        debug_log(std::string("=== command-type census (") + when + "): " + std::to_string(kinds)
+                  + " types, " + std::to_string(total) + " blocks (incl. sliding-window resends) ===");
+        for (int t = 0; t < 256; t++) {
+            if (!cstats[t].count) continue;
+            const char* nm = cmd_name(t);
+            char hex[56] = {0};
+            for (int z = 0; z < cstats[t].sampleLen && z < 16; z++) snprintf(hex+z*3, 4, "%02x ", cstats[t].sample[z]);
+            char line[200];
+            snprintf(line, sizeof(line), "  0x%02x %-19s x%-8ld len %d..%d  sample: %s",
+                     t, nm, cstats[t].count, cstats[t].minLen, cstats[t].maxLen, hex);
+            debug_log(line);
+        }
+    };
+
     while (!stop_) {
         uint8_t buf[1400]; sockaddr_in from; socklen_t fl = sizeof(from);
         int n = recvfrom(gs, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
         if (n > 0) {
             lastRecv = now_ms();
-            if (n >= 4 && rd32(buf+0x00)==hostNetID) lastHostRecv = now_ms();
-            // GUR ack/seq tracking from host type-0 packets
+            if (n >= 4 && rd32(buf+0x00)==hostNetID) {
+                lastHostRecv = now_ms();
+                if (!hostPortLogged) {
+                    hostPortLogged = true;
+                    debug_log("host game socket: " + ip_str(from.sin_addr.s_addr) + ":"
+                              + std::to_string((unsigned)ntohs(from.sin_port)) + " (we reply to :"
+                              + std::to_string((unsigned)ntohs(gameAddr.sin_port)) + ")");
+                }
+            }
+            // GUR (guaranteed-delivery) ack/seq tracking from host type-0 packets. The GUR sub-header
+            // sits at payload start: [0x0E flags][0x0F seq][0x10 hostAckA][0x11 hostAckB][0x12 cmd...].
+            // flag bits: 0x02 = channel-A data present (seq is the channel-A seq), 0x04 = channel-B
+            // data, 0x08 = this packet carries a GUR ack, 0x20 = ackB is in the byte at 0x12. We track
+            // the highest seq the host has sent us per channel (ackA/ackB, echoed back in our acks),
+            // and what the host has acked of OUR seq (hostAckA/hostAckB). See NETPLAY.md.
             if (n >= 0x12 && buf[0x09] == 0) {
                 uint8_t flags = buf[0x0E], seq = buf[0x0F];
                 if (flags & 0x02) ackA = seq;
                 if (flags & 0x04) ackB = seq;
-                if (flags & 0x20) ackB = buf[0x12];
+                if ((flags & 0x20) && n >= 0x13) ackB = buf[0x12];
                 hostAckA = buf[0x10]; hostAckB = buf[0x11];
             }
             // GameStartInfo (engine cmd 1): decode + publish lobby changes
@@ -580,10 +862,12 @@ void Client::run(bool scan, std::string targetIp) {
                 if (cur.valid) {
                     // Lobby departures (left or ejected): a player whose netId was in the previous
                     // roster but is gone from this one has left the lobby. The host removes them from
-                    // its broadcast roster (the engine's cmd-0x05 "removed" notice is unicast only to
-                    // the player itself, so we never see another player's). Match by netId across all
-                    // slots so a slot-move doesn't false-fire. We can't tell a voluntary leave from an
-                    // eject on the wire, so the line is neutral.
+                    // its broadcast roster; the engine's cmd-0x05 "removed" notice is unicast only to
+                    // the player itself (we never see another player's), so the roster diff is how we
+                    // learn of others' departures. Match by netId across all slots so a slot-move
+                    // doesn't false-fire. (Not gated to the lobby phase - it self-limits: once prevLobby
+                    // drops them too, it won't re-fire.) We can't tell a voluntary leave from an eject
+                    // on the wire, so the line is neutral.
                     if (prevLobby.valid && !gameLive) {
                         for (int i = 0; i < 6; i++) {
                             uint32_t was = prevLobby.slot[i].occupied ? prevLobby.slot[i].netId : 0;
@@ -593,6 +877,7 @@ void Client::run(bool scan, std::string targetIp) {
                             if (!stillHere) {
                                 std::string nm = prevLobby.slot[i].name;
                                 addChat("", "*** " + (nm.empty() ? ("Player " + std::to_string(i)) : nm) + " left the lobby ***", false);
+                                debug_log("lobby departure: slot " + std::to_string(i) + " '" + nm + "' (left or ejected)");
                             }
                         }
                     }
@@ -603,8 +888,9 @@ void Client::run(bool scan, std::string targetIp) {
                         if (s >= 0 && s < 6) { state_.ourColor = cur.slot[s].color; state_.ourReady = cur.slot[s].ready; }
                         prevLobby = cur;
                     }
-                    // Host game version (TApp::Version, from the GSI blob): show it once, and warn if
-                    // our advertised version doesn't match - the host will eject a mismatched client.
+                    // Host game version (TApp::Version, from the GSI blob): log it and post to chat
+                    // once. This is how we tell a 1.3.6 host (0x01030004) from a 1.4.1 host - the
+                    // latter drops our 1.3.0.4-advertising client where 1.3.6 accepts it.
                     if (!hostVerShown && cur.tappVersion) {
                         hostVerShown = true;
                         hostTappVer = cur.tappVersion;
@@ -615,6 +901,23 @@ void Client::run(bool scan, std::string targetIp) {
                         addChat("", "Host game version: " + ver_str(cur.tappVersion) + " (" + hex + ")", false);
                         if (verMismatch)
                             addChat("", "*** VERSION MISMATCH: we sent " + ver_str(myVer) + " - host will eject us ***", false);
+                    }
+                    // Positive drop detection: the host broadcasts the roster continuously, so the
+                    // host-silence timeout never fires on a LAN even after we are dropped. Instead,
+                    // once the roster has listed our netId, watch for it to vanish - that means the
+                    // host removed our slot (dropped/ejected us) while still broadcasting. Don't trip
+                    // during the start handshake (the roster briefly churns as the game loads).
+                    bool selfPresent = false;
+                    for (int i = 0; i < 6; i++)
+                        if (cur.slot[i].occupied && cur.slot[i].netId == assignedNetID) { selfPresent = true; break; }
+                    if (selfPresent) seenSelfInLobby = true;
+                    else if (seenSelfInLobby && !gameStarting && !gameLive) {
+                        if (verMismatch)
+                            setDisconnected("Ejected: wrong game version. Host is " + ver_str(hostTappVer)
+                                            + ", we sent " + ver_str(myVer) + ". Pass --ver " + ver_str(hostTappVer) + ".");
+                        else
+                            setDisconnected("Dropped from the lobby by the host.");
+                        break;
                     }
                 }
             }
@@ -636,6 +939,19 @@ void Client::run(bool scan, std::string targetIp) {
             // START-time roster control (type-1): cmd-4 -> status(3), cmd-5 -> status(4)
             if (buf[0x09]==1 && n>=0x12) {
                 uint32_t cc = rd32(buf+0x0E);
+                // DEBUG: log any type-1 control code outside the known lobby set (0,1,2,4,5,6) once
+                // each. This is where the master-election traffic shows up when the master leaves:
+                // TM_QUITTING_SESSION (0x0B), TM_RESYNC_MASTER (0x0D), TM_ACK_RESYNC_MASTER (0x0E),
+                // TM_SET_NEW_STATE (0x0F). Captures who bids/acks so we can compare to the KB's
+                // resync-master protocol (RNG_AND_DETERMINISM.md).
+                if (cc>=0x0B && cc<32 && !((resyncCcSeen>>cc)&1)) {
+                    resyncCcSeen |= (1u<<cc);
+                    char hx[80]={0}; int hb = n < 26 ? n : 26;
+                    for (int z=0; z<hb; z++) snprintf(hx+z*3, 4, "%02x ", buf[z]);
+                    char pre[112]; snprintf(pre, sizeof(pre), "RESYNC/ctrl type-1 cc=0x%02X src=%08X dst=%08X n=%d  ",
+                                            cc, rd32(buf+0x00), rd32(buf+0x04), n);
+                    debug_log(std::string(pre) + hx);
+                }
                 if (cc==4) {
                     send_status(gameAddr, 3);
                     // Parse the SetPlayerList roster into our peer table - every other
@@ -655,11 +971,12 @@ void Client::run(bool scan, std::string targetIp) {
                             pe.addr.sin_family = AF_INET;
                             memcpy(&pe.addr.sin_addr, e, 4);          // IP is already network order
                             // The host lists ITSELF in the roster with its bind address - and an OPU
-                            // 1.4.1 host (NetHelper) binds INADDR_ANY, so its own entry's IP is 0.0.0.0.
-                            // Broadcasting our in-game command turns to 0.0.0.0 goes nowhere, so the
-                            // host never gets our input and the lockstep stalls at the first command-turn
-                            // boundary (~tick 8). Substitute the host's real IP (known from discovery)
-                            // for any 0.0.0.0 roster entry. (Other peers carry a real IP via NatFix.)
+                            // 1.4.1 host (NetHelper) binds INADDR_ANY, so its own entry's IP is
+                            // 0.0.0.0. Broadcasting our in-game command turns to 0.0.0.0 goes nowhere,
+                            // so the host never gets our input and the lockstep stalls at the first
+                            // command-turn boundary (~tick 8). Substitute the host's real IP (known
+                            // from discovery) for any 0.0.0.0 roster entry. (Other peers carry a real
+                            // IP - the host learned theirs via NatFix from their packets.)
                             if (pe.addr.sin_addr.s_addr == 0) pe.addr.sin_addr.s_addr = hostIp;
                             pe.addr.sin_port = htons(rd16(e + 4));    // port is stored host order
                             newCount++;
@@ -682,6 +999,23 @@ void Client::run(bool scan, std::string targetIp) {
                     }
                 }
                 else if (cc==5) send_status(gameAddr, 4);
+            }
+            // Host "player removed" notification: type-0 game cmd 0x05 (flags 0x00, no channel). The
+            // dst NetID (buf+0x04) is the player being removed - our own NetID when WE are dropped, or
+            // another player's when they're kicked/leave a lobby we're in. (This is the same 0x05 the
+            // engine emits on a clean quit too - an effect of removal, not a kick command.) De-duped on
+            // dst since the host resends it.
+            if (buf[0x09]==0 && n>=0x13 && buf[0x12]==0x05 && rd32(buf+0x00)==hostNetID) {
+                uint32_t dst = rd32(buf+0x04);
+                if (dst != lastCmd05Dst) {
+                    lastCmd05Dst = dst;
+                    std::string who;
+                    { std::lock_guard<std::mutex> lk(mtx_);
+                      for (int i=0;i<6;i++) if (state_.lobby.slot[i].occupied && state_.lobby.slot[i].netId==dst) { who = state_.lobby.slot[i].name; break; } }
+                    char nb[16]; snprintf(nb, sizeof(nb), "%08X", dst);
+                    debug_log(std::string("host cmd-0x05 (player removed): netID=") + nb
+                              + (dst==assignedNetID ? " (us)" : who.empty() ? "" : (" '" + who + "'")));
+                }
             }
             // lobby/connection EVENTS (sequenced host packet, engine cmd at 0x12)
             if (buf[0x09]==0 && buf[0x08]>=5 && n>=0x13 && (buf[0x0E]&0x06) && rd32(buf+0x00)==hostNetID) {
@@ -722,6 +1056,7 @@ void Client::run(bool scan, std::string targetIp) {
                         { std::lock_guard<std::mutex> lk(mtx_); state_.gameStarted = true; }
                         setPhase(Phase::InGame, "Game started.");
                         addChat("", "*** GAME STARTED ***", false);
+                        fireGameStart();
                     }
                 }
             }
@@ -730,7 +1065,8 @@ void Client::run(bool scan, std::string targetIp) {
             // ctQuit) at a pinned mark, so we must stop mirroring or maxSentMark would advance past
             // it and the host would reject the quit.
             if (!leaving_ && buf[0x09]==0 && n>=0x18 && buf[0x12]==0x0C && rd32(buf+0x00)==clockNetID) {
-                if (!gameLive) { gameLive = true; gameStartMs = now_ms(); { std::lock_guard<std::mutex> lk(mtx_); state_.gameStarted = true; } setPhase(Phase::InGame, "Game started."); addChat("", "*** GAME STARTED ***", false); }
+                if (!gameLive) { gameLive = true; gameStartMs = now_ms(); { std::lock_guard<std::mutex> lk(mtx_); state_.gameStarted = true; } setPhase(Phase::InGame, "Game started."); addChat("", "*** GAME STARTED ***", false);
+                    fireGameStart(); }
                 cmd0cRecv++;
                 int execTick = (int)rd32(buf+0x14);
                 if (!haveFirstExec) { haveFirstExec=true; firstExec=execTick; lookahead=-execTick; }
@@ -830,7 +1166,6 @@ void Client::run(bool scan, std::string targetIp) {
                 uint32_t lsrc = rd32(buf+0x00);
                 int lslot = buf[0x13];
                 if (lsrc != assignedNetID && lslot >= 0 && lslot < 6 && lslot != (int)ourPlayerNum) {
-                    lastTurnMsBySlot[lslot] = now_ms();   // liveness per slot (for clock failover)
                     std::string nm;
                     { std::lock_guard<std::mutex> lk(mtx_);
                       if (state_.lobby.slot[lslot].occupied && !state_.lobby.slot[lslot].name.empty())
@@ -857,6 +1192,68 @@ void Client::run(bool scan, std::string targetIp) {
                     }
                 }
             }
+            // command-type census: tally every block from any non-self command turn (host + peers)
+            if (buf[0x09]==0 && n>=0x18 && buf[0x12]==0x0C && rd32(buf+0x00)!=assignedNetID) {
+                int sslot = buf[0x13];
+                std::string sname;
+                if (sslot >= 0 && sslot < 6) {
+                    lastTurnMsBySlot[sslot] = now_ms();   // liveness per slot (for clock failover)
+                    { std::lock_guard<std::mutex> lk(mtx_);                     // sender's display name
+                      if (state_.lobby.slot[sslot].occupied && !state_.lobby.slot[sslot].name.empty())
+                          sname = state_.lobby.slot[sslot].name; }
+                    if (sname.empty()) sname = "slot" + std::to_string(sslot);
+                    // DEBUG: log each distinct in-game turn source once - reveals the topology
+                    // (peer-direct vs master-relay) and which netID takes over after a host-leave.
+                    if (!loggedTurnSrcSlot[sslot]) {
+                        loggedTurnSrcSlot[sslot] = true;
+                        char pre[112]; snprintf(pre, sizeof(pre),
+                            "in-game turn source: slot=%d srcNetID=%08X (clock=%08X, host=%08X)",
+                            sslot, rd32(buf+0x00), clockNetID, hostNetID);
+                        debug_log(pre);
+                    }
+                }
+                int specExec = (int)rd32(buf+0x14), specIdx = 0;   // per-block exec mark = specExec + idx*cppi
+                for (int o = 0x18; o + 6 <= n; ) {
+                    uint8_t bt = buf[o], bl = buf[o+1];
+                    if (o + 6 + bl > n) break;
+                    if (opts_.commandCensus) {
+                    CmdStat& cs = cstats[bt];
+                    if (!cs.count) { cs.minLen = bl; cs.maxLen = bl; cs.sampleLen = (bl < 24 ? bl : 24); memcpy(cs.sample, buf+o+6, cs.sampleLen); }
+                    else { if (bl < cs.minLen) cs.minLen = bl; if (bl > cs.maxLen) cs.maxLen = bl; }
+                    cs.count++;
+                    // log each DISTINCT interesting command once so a controlled in-game action can
+                    // be correlated to its bytes. Dedup on the command CONTENT (type + len + data) -
+                    // NOT unk (that is a constant per-stream token, and the sliding window resends
+                    // the same block many times). Skip the idle heartbeat ctNop (0x00) and the
+                    // frequently-rebroadcast ctMachineSettings (0x34, CPU/RAM/resolution) - both noise.
+                    if (bt != 0x00 && bt != 0x34) {
+                        uint32_t h = 2166136261u;                       // FNV-1a over type + len + data
+                        h = (h ^ bt) * 16777619u; h = (h ^ (uint32_t)bl) * 16777619u;
+                        for (int z = 0; z < bl; z++) h = (h ^ buf[o+6+z]) * 16777619u;
+                        bool seen = false; for (int z = 0; z < 128; z++) if (recentCmd[z] == h) { seen = true; break; }
+                        if (!seen) {
+                            recentCmd[recentCmdPos] = h; recentCmdPos = (recentCmdPos + 1) & 127;
+                            char pre[64];
+                            snprintf(pre, sizeof(pre), "CMD 0x%02x slot=%d exec=%d len=%d  ",
+                                     bt, buf[0x13], (int)rd32(buf+0x14), bl);
+                            debug_log(std::string(pre) + decode_cmd(bt, buf+o+6, bl));
+                        }
+                    }
+                    }   // commandCensus
+                    // Observers (e.g. OP2Spectator's recorder) get each real action. Skip the idle
+                    // heartbeat (ctNop 0x00) and machine-spec noise (ctMachineSettings 0x34), and the
+                    // events already delivered via onChat (chat 0x30, quit 0x31).
+                    if (hooks_.onCommand && sslot >= 0 && sslot < 6 && bt != 0x00 && bt != 0x34 && bt != 0x30 && bt != 0x31) {
+                        std::string nm = cmd_name(bt);
+                        std::string dec = decode_cmd(bt, buf+o+6, bl);   // starts with the name
+                        // pass just the FIELDS (strip the leading name) - observers get the name separately
+                        std::string fields = (dec.size() > nm.size() && dec.compare(0, nm.size(), nm) == 0) ? dec.substr(nm.size()) : dec;
+                        size_t fs = fields.find_first_not_of(' '); fields = (fs == std::string::npos) ? "" : fields.substr(fs);
+                        hooks_.onCommand(specExec + specIdx*cppi, sslot, sname, bt, nm, fields);
+                    }
+                    o += 6 + bl; specIdx++;
+                }
+            }
             // latch lobby join + auto ready-up
             if (!lobbyJoined && hostAckA >= ourSeqA) {
                 lobbyJoined = true;
@@ -864,8 +1261,10 @@ void Client::run(bool scan, std::string targetIp) {
                 ourSeqA = 2;
                 for (int r=0;r<3;r++) send_status_update(4, 1);   // auto-ready (field 4 = Ready)
                 ++ourSeqA;                                         // auto-greeting (lobby chat)
-                for (int r=0;r<3;r++) send_lobby_chat("Hello from OP2DummyPlayer!");
-                addChat(myName, "Hello from OP2DummyPlayer!", true);
+                if (!opts_.helloMessage.empty()) {
+                    for (int r=0;r<3;r++) send_lobby_chat(opts_.helloMessage);
+                    addChat(myName, opts_.helloMessage, true);
+                }
             }
             // lobby chat from the GUI (cmd-6), once joined and before the game starts
             if (lobbyJoined && !gameStarting) {
@@ -882,6 +1281,8 @@ void Client::run(bool scan, std::string targetIp) {
             send_gur_ack(gameAddr);
             lastKeep = now_ms();
         }
+        // periodic command-type census dump (every 30 s during play)
+        if (opts_.commandCensus && gameLive && now_ms() - lastStatDump > 30000) { dumpCmdStats("periodic"); lastStatDump = now_ms(); }
         // graceful leave: deliver the goodbye/quit, then exit.
         // Lobby: a real cmd-0x0B quit (host frees our slot), which acks fast.
         // In-game: SELF-SEND a command turn (cmd-0x0C) carrying a goodbye chat block (0x30) at a
@@ -939,9 +1340,11 @@ void Client::run(bool scan, std::string targetIp) {
         // Lobby eviction via host-SPECIFIC silence. When the host rejects/removes us (most often a
         // version mismatch - it then prints "had wrong game version and was ejected"), it stops
         // sending TOWARD us but its LAN broadcasts keep `lastRecv` fresh - so the plain recv timeout
-        // below never fires. Watch the gap since the last packet whose source IS the host instead
-        // (normal host unicast cadence is < 1 s, so a 4 s gap is unambiguous). If we already know our
-        // advertised version != the host's, say so specifically - that's the actionable case.
+        // below never fires and the broadcast roster stays stale-listing us. Watch the gap since the
+        // last packet whose source IS the host instead (normal host unicast cadence is < 1 s, so a 4 s
+        // gap is unambiguous). If we already know our advertised version != the host's, say so
+        // specifically - that's the actionable case. (The engine's cmd-0x05 "player removed"
+        // notification, when it comes, is just the symptom - it fires on a clean quit too.)
         if (lobbyJoined && !gameStarting && !gameLive && now_ms() - lastHostRecv > 4000) {
             if (verMismatch)
                 setDisconnected("Ejected: wrong game version. Host is " + ver_str(hostTappVer)
@@ -962,6 +1365,8 @@ void Client::run(bool scan, std::string targetIp) {
     }
 
     if (stop_ && !snapshot().disconnected) setDisconnected("Disconnected.");
+    if (opts_.commandCensus) dumpCmdStats("final");
+    if (hooks_.onSessionEnd) { ClientState s = snapshot(); hooks_.onSessionEnd(s.disconnected ? s.disconnectReason : "session ended"); }
     close_sock(gs);
     net_cleanup();
     running_ = false;

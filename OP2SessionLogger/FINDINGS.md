@@ -214,7 +214,7 @@ to compare a 1.4.1 host (which drops our 1.3.0.4-advertising client) against a 1
 - `0x18` ctMoTransfer - selection header confirmed, trailing fields not in the spec doc; capture live.
 
 Field layouts come from the engine's `DataStructure CommandPacket.txt` (authoritative) plus live
-capture. The decoder (`cmd_name` / `decode_cmd` in `src/net/op2client.cpp`) now renders every command
+capture. The decoder (`cmd_name` / `decode_cmd` in `../common/op2net/op2client.cpp`) now renders every command
 above; extend it as the remaining enums/fields are pinned.
 
 ## Appendix: engine internals (from the executor `FUN_0040e300`)

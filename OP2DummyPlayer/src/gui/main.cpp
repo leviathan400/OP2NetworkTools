@@ -2,8 +2,8 @@
 //
 // This file is ONLY presentation: it owns an op2::Client, reads a thread-safe ClientState
 // snapshot once per frame, and renders it. It never touches sockets or wire bytes. All
-// networking lives in ../net (op2client / op2proto), so the GUI and the net-client are
-// cleanly separable (the net layer builds and runs with no GUI dependency at all).
+// networking lives in the shared library ../../../common/op2net (op2client / op2proto), so the
+// GUI and the net-client are cleanly separable (the net layer has no GUI dependency at all).
 #include "op2client.h"
 
 #include "imgui.h"
@@ -30,6 +30,7 @@ static ImVec4 op2_color(int c) {
 }
 
 int main(int argc, char** argv) {
+    op2::set_debug_log_name("op2dummyplayer_debug.txt");
     op2::debug_log("=== OP2DummyPlayer started ===");
 
     // Optional startup flags (so the app can be driven headlessly without clicking the GUI):
@@ -76,6 +77,7 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     op2::Client client;
+    { op2::ClientOptions o; o.helloMessage = "Hello from OP2DummyPlayer!"; o.commandCensus = false; client.setOptions(o); }
     if (tappVer) client.setTappVersion(tappVer);   // apply --ver before any connect
 
     // Fire the requested auto-connect once, before the UI loop (the GUI still works normally after).

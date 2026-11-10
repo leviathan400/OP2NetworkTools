@@ -1,10 +1,11 @@
 // main.cpp - OP2Spectator GUI (Dear ImGui + GLFW + OpenGL3).
 //
-// This file is ONLY presentation: it owns an op2::Client, reads a thread-safe ClientState
-// snapshot once per frame, and renders it. It never touches sockets or wire bytes. All
-// networking lives in ../net (op2client / op2proto), so the GUI and the net-client are
-// cleanly separable (the net layer builds and runs with no GUI dependency at all).
+// It owns an op2::Client (the shared net library, common/op2net), reads a thread-safe
+// ClientState snapshot once per frame, and renders it. It never touches sockets or wire bytes.
+// The match recorder (recorder.h) is fed through the client's ClientHooks on the net worker
+// thread; the GUI only reads its status, under recMtx.
 #include "op2client.h"
+#include "recorder.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
@@ -13,6 +14,34 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+
+// The structured match recorder. Written from the net worker thread (via ClientHooks), status
+// read by the GUI thread - so every access goes through recMtx. Static so it outlives the Client
+// (whose destructor joins the worker, which fires onSessionEnd into the recorder).
+static std::mutex    recMtx;
+static op2::Recorder rec;
+
+static op2::ClientHooks recorder_hooks() {
+    op2::ClientHooks h;
+    h.onSessionBegin = [](const std::string& hostIp, const std::string& gameName) {
+        std::lock_guard<std::mutex> lk(recMtx); rec.begin(op2::exe_dir(), hostIp, gameName);
+    };
+    h.onChat = [](int tick, const std::string& from, const std::string& text, bool self) {
+        std::lock_guard<std::mutex> lk(recMtx); rec.chat(tick, from, text, self);
+    };
+    h.onGameStart = [](const op2::LobbyInfo& lobby, uint32_t hostVer, bool nethelper, int ourPlayer) {
+        std::lock_guard<std::mutex> lk(recMtx); rec.matchHeader(lobby, hostVer, nethelper, ourPlayer);
+    };
+    h.onCommand = [](int mark, int slot, const std::string& player, uint8_t type,
+                     const std::string& name, const std::string& fields) {
+        std::lock_guard<std::mutex> lk(recMtx); rec.action(mark, slot, player, type, name, fields);
+    };
+    h.onSessionEnd = [](const std::string& reason) {
+        std::lock_guard<std::mutex> lk(recMtx); rec.end(reason);
+    };
+    return h;
+}
 
 static void glfw_error(int e, const char* d) { fprintf(stderr, "GLFW error %d: %s\n", e, d); }
 
@@ -47,6 +76,7 @@ static ImVec4 op2_color(int c) {
 }
 
 int main(int argc, char** argv) {
+    op2::set_debug_log_name("op2spectator_debug.txt");
     op2::debug_log("=== OP2Spectator started ===");
 
     // Optional startup flags (so the app can be driven headlessly without clicking the GUI -
@@ -110,6 +140,8 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     op2::Client client;
+    { op2::ClientOptions o; o.helloMessage = "OP2Spectator joined - observing & logging."; o.commandCensus = true; client.setOptions(o); }
+    client.setHooks(recorder_hooks());
     if (tappVer) client.setTappVersion(tappVer);   // apply --ver before any connect
 
     // Fire the requested auto-connect once, before the UI loop (the GUI still works normally after).
@@ -222,13 +254,15 @@ int main(int argc, char** argv) {
         }
 
         // ---- recording indicator ----
-        if (!st.recFile.empty()) {
+        std::string recFile; long recActions = 0;
+        { std::lock_guard<std::mutex> lk(recMtx); recFile = rec.baseName(); recActions = rec.actionCount(); }
+        if (!recFile.empty()) {
             // show just the filename, not the full path
-            size_t slash = st.recFile.find_last_of("/\\");
-            const char* name = (slash == std::string::npos) ? st.recFile.c_str() : st.recFile.c_str() + slash + 1;
+            size_t slash = recFile.find_last_of("/\\");
+            const char* name = (slash == std::string::npos) ? recFile.c_str() : recFile.c_str() + slash + 1;
             ImGui::TextColored(ImVec4(1.0f,0.3f,0.3f,1), "%s", st.disconnected ? "  REC stopped" : "\xE2\x97\x8f REC");
             ImGui::SameLine();
-            ImGui::TextDisabled("%s.log  (%ld actions)", name, st.recActions);
+            ImGui::TextDisabled("%s.log  (%ld actions)", name, recActions);
         }
 
         // ---- lobby ----

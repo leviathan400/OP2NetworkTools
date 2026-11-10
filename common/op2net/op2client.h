@@ -1,5 +1,8 @@
 // op2client.h - the stateful Outpost 2 multiplayer client, on its own thread.
 //
+// Shared by OP2DummyPlayer, OP2SessionLogger and OP2Spectator (common/op2net). App-specific
+// behaviour goes through ClientOptions + ClientHooks below, never into this library.
+//
 // This is the entire net-client surface the GUI (or any front-end) needs. It owns a worker
 // thread that runs the full protocol flow (discover -> join -> lobby -> start -> in-game),
 // ported from the verified op2session.cpp. The GUI never touches sockets or wire bytes: it
@@ -12,7 +15,7 @@
 #pragma once
 
 #include "op2proto.h"
-#include "recorder.h"
+#include <functional>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -35,9 +38,16 @@ enum class Phase {
 
 const char* phase_name(Phase p);
 
-// Append a timestamped line to the debug log (op2spectator_debug.txt, next to the exe).
+// Append a timestamped line to the debug log (next to the exe; name set by set_debug_log_name).
 // Thread-safe; opens/closes per call so the file is always flushed even on a crash.
 void debug_log(const std::string& line);
+
+// Choose the debug log's file name (e.g. "op2dummyplayer_debug.txt"). Call once, first thing in
+// main(), before any debug_log(). Default "op2net_debug.txt".
+void set_debug_log_name(const std::string& fileName);
+
+// Directory of the running executable, ending in a path separator.
+std::string exe_dir();
 
 struct ChatLine {
     std::string ts;     // "[hh:mm]" local time the line was logged
@@ -80,10 +90,34 @@ struct ClientState {
     // disconnect
     bool        disconnected = false;
     std::string disconnectReason;
+};
 
-    // OP2Spectator: structured-recorder status (for the "● REC" indicator)
-    std::string recFile;             // match-file path prefix once recording has begun
-    long        recActions = 0;      // count of distinct actions recorded so far
+// Per-app behaviour. Set before connecting.
+struct ClientOptions {
+    // Lobby greeting sent (3x, for reliability) once we're in the lobby. Empty = say nothing.
+    std::string helloMessage;
+    // Developer recon: tally every received command type (census dumped to the debug log every
+    // 30 s and at the end) and log each distinct non-noise command with its decode.
+    bool commandCensus = false;
+};
+
+// Optional callbacks for observers (e.g. OP2Spectator's recorder). All are invoked on the WORKER
+// thread, never concurrently with each other; an empty std::function is simply skipped. They must
+// not call back into Client (except the thread-safe public methods) and should return quickly.
+struct ClientHooks {
+    // A host was found/targeted and we're about to join.
+    std::function<void(const std::string& hostIp, const std::string& gameName)> onSessionBegin;
+    // Every chat/system line added to the log. tick < 0 => lobby phase. from == "" => system line.
+    std::function<void(int tick, const std::string& from, const std::string& text, bool self)> onChat;
+    // The game has started (fires once per game): final roster + host facts.
+    std::function<void(const LobbyInfo& lobby, uint32_t hostTappVer, bool nethelper, int ourPlayerNum)> onGameStart;
+    // A non-noise in-game command from another player (not ctNop/0x34 or chat/quit, which arrive via
+    // onChat). The sliding window resends blocks, so the same (slot, mark, type) can repeat - dedup
+    // by those. `fields` is the decoded payload without the leading command name.
+    std::function<void(int mark, int slot, const std::string& player, uint8_t type,
+                       const std::string& name, const std::string& fields)> onCommand;
+    // The session is over (worker exiting). reason = disconnect reason or "session ended".
+    std::function<void(const std::string& reason)> onSessionEnd;
 };
 
 class Client {
@@ -97,6 +131,10 @@ public:
     // Override the advertised TApp::Version (call before connecting). Default TAPP_VERSION
     // (1.4.0.1). Must match the host's version family or the host drops us after join.
     void setTappVersion(uint32_t v);
+
+    // App behaviour + observer callbacks (call before connecting).
+    void setOptions(const ClientOptions& o);
+    void setHooks(const ClientHooks& h);
 
     // Start a session. Either scan the LAN by broadcast, or target a specific host IP.
     // Returns false if a session is already running.
@@ -129,8 +167,8 @@ private:
     std::vector<std::string> pendingChat_;        // guarded by mtx_
     std::string             playerName_ = "OPU";  // guarded by mtx_ (set before start)
     uint32_t                tappVersion_ = TAPP_VERSION;  // guarded by mtx_ (set before start)
-
-    Recorder                rec_;   // structured match recorder; touched ONLY from the worker thread
+    ClientOptions           opts_;                // set before start; read by the worker
+    ClientHooks             hooks_;               // set before start; called on the worker
 
     // helpers (run on worker thread; lock as noted)
     void setPhase(Phase p, const std::string& status);
