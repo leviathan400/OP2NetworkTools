@@ -1,5 +1,7 @@
 # OP2NetworkTools
 
+[![Build](https://github.com/leviathan400/OP2NetworkTools/actions/workflows/build.yml/badge.svg)](https://github.com/leviathan400/OP2NetworkTools/actions/workflows/build.yml)
+
 A suite of network tools for **Outpost 2**, all speaking the game's own wire
 protocols **without running Outpost 2**. The headline result is a complete external
 multiplayer **client** - an independent (non-engine) Outpost 2 client: it

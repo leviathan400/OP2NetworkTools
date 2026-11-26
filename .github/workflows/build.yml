@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The three Dear ImGui apps, all built on the shared common/op2net library. They are
+  # cross-platform, so build each one on Windows and Linux.
+  gui-apps:
+    name: ${{ matrix.app }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        app: [OP2DummyPlayer, OP2SessionLogger, OP2Spectator]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GLFW/OpenGL dev packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xorg-dev libgl1-mesa-dev
+
+      - name: Configure
+        # X11 only on Linux: skips GLFW's Wayland backend and its extra build dependencies.
+        run: cmake -S ${{ matrix.app }} -B build -DCMAKE_BUILD_TYPE=Release -DGLFW_BUILD_WAYLAND=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+  # Windows-only tools: the OP2Session research console and the op2finder C finder (Winsock),
+  # and the OP2LanScan WinForms app (.NET Framework 4.8).
+  windows-tools:
+    name: Windows tools
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build OP2Session
+        working-directory: OP2Session
+        run: cl /nologo /EHsc /O2 /W3 /Fe:op2session.exe op2session.cpp ws2_32.lib
+
+      - name: Build op2finder
+        working-directory: op2finder
+        run: cl /nologo /O2 /W3 /Fe:op2finder.exe op2finder.c ws2_32.lib
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build OP2LanScan
+        run: msbuild OP2LanScan/OP2LanScan/OP2LanScan.csproj /p:Configuration=Release /v:minimal /nologo
+
+  # The Python reference finder: standard library only, so a byte-compile catches syntax errors.
+  python:
+    name: op2finder-py
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Byte-compile
+        run: python -m py_compile op2finder-py/op2finder.py
