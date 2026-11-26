@@ -59,7 +59,8 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
 
       - name: Build OP2LanScan
-        run: msbuild OP2LanScan/OP2LanScan/OP2LanScan.csproj /p:Configuration=Release /v:minimal /nologo
+        # Platform is explicit: the x86 MSVC env above exports Platform=x86, which MSBuild would pick up.
+        run: msbuild OP2LanScan/OP2LanScan/OP2LanScan.csproj /p:Configuration=Release /p:Platform=AnyCPU /v:minimal /nologo
 
   # The Python reference finder: standard library only, so a byte-compile catches syntax errors.
   python:
